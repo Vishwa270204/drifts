@@ -24,8 +24,15 @@ st.set_page_config(page_title="IoT Drift & Retraining Dashboard", layout="wide")
 SEED, EPS, MAX_CAT = 42, 1e-4, 30
 INC, ONL, CON, TRA, FULL = ("Incremental learning", "Online learning", "Continual learning (replay buffer)",
                             "Transfer learning", "Full retraining")
-METHODS = [INC, ONL, CON, TRA, FULL]
-STRATS = ["New data only", "Old data + new data", "Sliding window"]
+MAX_PLOT = 3000  # most recent points kept on the live charts
+METHOD_INFO = {
+    INC: ("Quick update", "Gently adjusts the current model using the chosen rows. Fast, and keeps most of what it already knows."),
+    ONL: ("Learn row by row", "Updates the model one row at a time in arrival order, as if learning live. Very adaptive, but can be noisy."),
+    CON: ("Update while remembering", "Learns the new rows while re-practising a sample of older rows, so it is less likely to forget old patterns."),
+    TRA: ("Fine-tune current model", "Starts from what the current model already learned and tunes it on the chosen rows."),
+    FULL: ("Start fresh", "Builds a brand-new model from scratch on the chosen rows. Slowest, but drops old habits."),
+}
+STRATS = ["New Data Only", "Old + New Data", "Sliding Window"]
 MODELS = {  # partial = supports partial_fit; transfer = weights can be carried over
     "SGD classifier (log-loss)": dict(partial=True, transfer=True),
     "MLP neural network": dict(partial=True, transfer=True),
@@ -152,6 +159,8 @@ def prepare(df, target, num, cat, ts, model_name, base_frac, hist_frac, delay, b
     train, hist, rest = d.iloc[:ntr], d.iloc[ntr:nb], d.iloc[nb:]
     m = np.arange(len(rest)) % 5 == 4  # every 5th post-baseline row is held out (never replayed / trained on)
     recent, stream = rest[m], rest[~m]
+    jj = np.where(m)[0]
+    rpos = jj - jj // 5  # stream rows that precede each recent hold-out row
     k = len(names)
     if train["_y"].nunique() < k:
         raise ValueError("The baseline-train split does not contain every class. Increase the baseline fraction, "
@@ -181,10 +190,10 @@ def prepare(df, target, num, cat, ts, model_name, base_frac, hist_frac, delay, b
     S.update(
         ready=True, sig=None, model=model, base_model=copy.deepcopy(model), model_name=model_name,
         names=[str(v) for v in names], feats=feats, num=num, cat=cat, target=target,
-        Xtr=Xtr, ytr=ytr, Xh=Xh, yh=yh, Xr=Xr, yr=yr, Xs=pre.transform(stream[feats]), ys=ys, F=F,
+        Xtr=Xtr, ytr=ytr, Xh=Xh, yh=yh, Xr=Xr, yr=yr, rpos=rpos, Xs=pre.transform(stream[feats]), ys=ys, F=F,
         T=stream["_ts"].tolist(), anom=anom, ref=ref, label_ref=lab_cnt / lab_cnt.sum(),
         q_miss=train[feats].isna().mean(), q_lo=train[num].min() if num else {}, q_hi=train[num].max() if num else {},
-        ref_err=1 - base_hist["Accuracy"], base_metrics=dict(hist=base_hist, recent=metrics(model, Xr, yr, k)),
+        ref_err=1 - base_hist["Accuracy"], base_metrics=dict(hist=base_hist),
         cfg=dict(delay=delay, win=win, thr=thr, delta=delta, k=k, has_ts=bool(ts)),
         counts=dict(train=len(train), hist=len(hist), recent=len(recent), stream=len(stream)),
         version=0, model_label="Baseline (v0)", decisions=[], cand=None,
@@ -197,7 +206,7 @@ def reset_stream():
     S.model, S.version, S.model_label = copy.deepcopy(S.base_model), 0, "Baseline (v0)"
     S.update(pos=0, lp=0, running=False, started=False, pred=np.full(n, -1), ver=np.zeros(n, int),
              err=np.full(n, np.nan), adwin=ADWIN(delta=S.cfg["delta"]), events=[], psi_hist=[], psis={},
-             lpsi=0.0, psi_on=False, cand=None, decisions=[])
+             lpsi=0.0, psi_on=False, last_retrain=None, retrains=[], updates=[])
 
 
 # ───────────────────────── drift logic ─────────────────────────
@@ -288,14 +297,13 @@ def step(batch):
 
 
 # ───────────────────────── retraining ─────────────────────────
-def compat(method):
-    info = MODELS[S.model_name]
-    if method in (INC, ONL, CON) and not info["partial"]:
-        return f"**{S.model_name}** has no `partial_fit`, so '{method}' is unavailable. Use an SGD or MLP baseline, or Full retraining."
-    if method == TRA and not info["transfer"]:
-        return ("Transfer learning is disabled: tree ensembles have no weights to carry over, and the feature space/classes "
-                "are unchanged, so there is nothing to transfer to. Use Full retraining instead.")
-    return None
+def available_methods(strategy, W):
+    """Only methods that are technically valid for the chosen model and the data selected right now."""
+    X, y, _ = select_training(strategy, W)
+    ms = [INC, ONL, CON] if MODELS[S.model_name]["partial"] else []
+    if MODELS[S.model_name]["transfer"] and len(np.unique(y)) == S.cfg["k"]:
+        ms.append(TRA)
+    return ms + [FULL]
 
 
 def select_training(strategy, W):
@@ -347,8 +355,25 @@ def train_candidate(strategy, method, W, epochs, bs, replay_n, ratio):
                     b = idx[s:s + bs]
                     j = rng.choice(len(bufX), max(1, int(len(b) * ratio)))
                     m.partial_fit(np.vstack([X[b], bufX[j]]), np.concatenate([y[b], bufy[j]]))
-    ev = lambda mod: dict(hist=metrics(mod, S.Xh, S.yh, k), recent=metrics(mod, S.Xr, S.yr, k))
-    return dict(model=m, method=method, strategy=strategy, n=len(y), cur=ev(cur), new=ev(m), label=S.model_label)
+    msk = S.rpos <= S.lp  # recent hold-out rows whose labels would already be available
+
+    def ev(mod):
+        return dict(hist=metrics(mod, S.Xh, S.yh, k),
+                    recent=metrics(mod, S.Xr[msk], S.yr[msk], k) if msk.sum() >= 10 else None)
+    return dict(model=m, method=method, strategy=strategy, n=len(y), n_recent=int(msk.sum()), cur=ev(cur), new=ev(m))
+
+
+def run_retrain(strategy, method, W, epochs, bs, replay_n, ratio):
+    """User-triggered: train, then immediately serve the new model (no accept/reject step)."""
+    r = train_candidate(strategy, method, W, epochs, bs, replay_n, ratio)
+    r.update(before_label=S.model_label, at=S.pos)
+    S.version += 1
+    S.model, S.model_label = r.pop("model"), f"v{S.version} · {METHOD_INFO[method][0]} · {strategy}"
+    r["after_label"] = S.model_label
+    S.adwin = ADWIN(delta=S.cfg["delta"])  # restart error monitoring for the new model
+    S.updates.append(S.pos)
+    S.retrains.append(dict(at_row=S.pos, model=S.model_label, trained_on_rows=r["n"]))
+    S.last_retrain = r
 
 
 # ───────────────────────── plotting ─────────────────────────
@@ -357,6 +382,12 @@ def cm_fig(cm, title):
     fig.update_layout(title=title, height=300, margin=dict(l=10, r=10, t=40, b=10), xaxis_title="Predicted", yaxis_title="Actual",
                       yaxis_autorange="reversed")
     return fig
+
+
+def show(col, fig, key):
+    """Stable key + uirevision so Streamlit/Plotly update the existing chart in place (no reset of zoom/legend)."""
+    fig.update_layout(uirevision="live", transition=dict(duration=0))
+    col.plotly_chart(fig, use_container_width=True, key=key)
 
 
 def vline(fig, x, color, **kw):
@@ -435,11 +466,9 @@ c = S.counts
 st.caption(f"Splits (chronological): baseline-train {c['train']:,} · historical hold-out {c['hist']:,} · "
            f"stream (replayed) {c['stream']:,} · recent hold-out {c['recent']:,} (every 5th post-baseline row, never replayed or trained on).")
 bm = S.base_metrics
-b1, b2, b3, b4 = st.columns(4)
+b1, b2 = st.columns(2)
 b1.metric("Baseline accuracy (historical hold-out)", f"{bm['hist']['Accuracy']:.3f}")
 b2.metric("Baseline F1 (historical hold-out)", f"{bm['hist']['F1']:.3f}")
-b3.metric("Baseline accuracy (recent hold-out)", f"{bm['recent']['Accuracy']:.3f}")
-b4.metric("Baseline F1 (recent hold-out)", f"{bm['recent']['F1']:.3f}")
 
 # 2 ─ stream
 st.header("2 · Stream simulation & live monitoring")
@@ -453,8 +482,8 @@ if k3.button("⏯ Resume", disabled=S.running or not S.started or finished, use_
     S.running = True
 if k4.button("⟲ Reset", use_container_width=True):
     reset_stream()
-batch = k5.slider("Rows per tick", 1, 100, 10)
-interval = st.slider("Seconds between ticks", 0.2, 3.0, 0.8, 0.1)
+batch = k5.slider("Rows per tick", 1, 100, 1)
+interval = st.slider("Seconds between incoming rows", 0.1, 5.0, 0.5, 0.1)
 
 
 @st.fragment(run_every=interval if S.running else None)
@@ -474,17 +503,22 @@ def live_panel():
     m4.metric("Max feature PSI", f"{max(S.psis.values(), default=0):.3f}")
     m5.metric("Anomaly rate", f"{S.anom[:pos].mean():.1%}" if pos else "–")
     m6.metric("Drift events", len(S.events))
+    st.caption(f"Serving model: **{S.model_label}**")
     status = "▶ running" if S.running else ("✔ finished" if finished else "⏸ paused/idle")
     if S.events and pos - S.events[-1]["pos"] <= 3 * W:
         e = S.events[-1]
-        st.error(f"🚨 **Drift alert ({e['source']})** at row {e['pos']}: {e['detail']}\n\n" + "\n".join(f"- {x}" for x in e["explanation"].split(" | "))
-                 + f"\n\n*Stream is still running ({status}). Retrain in section 3.*")
+        why = ("The incoming data looks different from what the model learned from, so its predictions may become less reliable."
+               if e["source"] == "PSI" else "The model's recent mistakes changed noticeably, which suggests it is getting less accurate.")
+        st.error(f"🚨 **Drift detected ({e['source']})** at row {e['pos']}: {e['detail']}\n\n**What we think is happening**\n"
+                 + "\n".join(f"- {x}" for x in e["explanation"].split(" | "))
+                 + f"\n\n**Why it matters:** {why}\n\n*The stream keeps running ({status}). Nothing is retrained automatically — "
+                 "press **Retrain Model** in section 3 when you are ready.*")
     else:
         st.success(f"No active drift alert · stream {status}")
     if pos == 0:
         st.info("Press **Start** to replay the stream.")
         return
-    lo = max(0, pos - 300)
+    lo = max(0, pos - MAX_PLOT)  # everything revealed so far stays on the chart
     x = S.T[lo:pos]
     sel = st.multiselect("Sensors to plot (numeric features)", S.num, default=S.num[:2], max_selections=3, key="plot_sel")
     g1, g2 = st.columns(2)
@@ -493,14 +527,14 @@ def live_panel():
         an = np.where(S.anom[lo:pos])[0]
         for i, col in enumerate(sel, 1):
             v = S.F[col].to_numpy()[lo:pos]
-            fig.add_trace(go.Scatter(x=x, y=v, mode="lines", name=col), row=i, col=1)
+            fig.add_trace(go.Scatter(x=x, y=v, mode="lines+markers" if pos - lo < 100 else "lines", marker=dict(size=4), name=col), row=i, col=1)
             fig.add_trace(go.Scatter(x=[x[j] for j in an], y=v[an], mode="markers", marker=dict(color="red", size=7),
                                      name="anomaly (|z|>4)", showlegend=i == 1), row=i, col=1)
         for e in S.events:
             if lo < e["pos"] <= pos:
                 vline(fig, S.T[e["pos"] - 1], "crimson")
         fig.update_layout(title="Incoming sensor values & anomalies", height=380, margin=dict(l=10, r=10, t=40, b=10))
-        g1.plotly_chart(fig, use_container_width=True)
+        show(g1, fig, "ch_sensors")
     else:
         g1.info("No numeric features selected/available for the sensor chart.")
     pr, er = S.pred[lo:pos], S.err[lo:pos]
@@ -511,14 +545,17 @@ def live_panel():
                                  marker=dict(color=colr, size=6)), row=1, col=1)
     fig.update_yaxes(categoryorder="array", categoryarray=S.names, row=1, col=1)
     if lp > 10:
-        a = max(0, lp - 300)
+        a = max(0, lp - MAX_PLOT)
         roll = pd.Series(S.err[:lp]).rolling(50, min_periods=10).mean().iloc[a:lp]
         fig.add_trace(go.Scatter(x=S.T[a:lp], y=roll, mode="lines", name="rolling error (50)", line=dict(color="orange")), row=2, col=1)
     for e in S.events:
         if e["source"] == "ADWIN" and lo < e["pos"] <= pos:
             vline(fig, S.T[e["pos"] - 1], "purple")
-    fig.update_layout(title="Model predictions & delayed error", height=380, margin=dict(l=10, r=10, t=40, b=10))
-    g2.plotly_chart(fig, use_container_width=True)
+    for u in S.updates:
+        if lo < u <= pos:
+            vline(fig, S.T[u - 1], "green")  # model updated here
+    fig.update_layout(title="Model predictions & delayed error (green line = model updated)", height=380, margin=dict(l=10, r=10, t=40, b=10))
+    show(g2, fig, "ch_pred")
 
     g3, g4 = st.columns(2)
     if S.psi_hist:
@@ -530,12 +567,12 @@ def live_panel():
             fig.add_trace(go.Scatter(x=[S.T[e["pos"] - 1] for e in ev], y=[S.cfg["thr"]] * len(ev), mode="markers", name=f"{src} alert",
                                      marker=dict(symbol=sym, size=13, color="crimson" if src == "PSI" else "purple")))
         fig.update_layout(title="Drift history (PSI over time, alerts marked)", height=330, margin=dict(l=10, r=10, t=40, b=10))
-        g3.plotly_chart(fig, use_container_width=True)
+        show(g3, fig, "ch_drift")
     if S.psis:
         p = pd.Series(S.psis).sort_values().tail(15)
         fig = go.Figure(go.Bar(x=p.values, y=p.index, orientation="h", marker_color=["crimson" if v >= S.cfg["thr"] else "steelblue" for v in p.values]))
         fig.update_layout(title="Current PSI per feature", height=330, margin=dict(l=10, r=10, t=40, b=10))
-        g4.plotly_chart(fig, use_container_width=True)
+        show(g4, fig, "ch_psi")
     if S.events:
         st.subheader("Drift event log")
         st.dataframe(pd.DataFrame(S.events)[["pos", "time", "source", "detail", "explanation"]].iloc[::-1], use_container_width=True, hide_index=True)
@@ -544,71 +581,86 @@ def live_panel():
 live_panel()
 
 # 3 ─ retraining
-st.header("3 · Retraining")
-r1, r2 = st.columns(2)
-strategy = r1.radio("Training-data strategy", STRATS, horizontal=True)
-method = r2.selectbox("Retraining method", METHODS)
-p1, p2, p3, p4 = st.columns(4)
-W = p1.number_input("Sliding-window size (labelled rows)", 50, 20000, 500, 50)
-epochs = p2.number_input("Epochs (incremental / continual)", 1, 20, 3)
-replay_n = p3.number_input("Replay buffer size", 50, 20000, 500, 50)
-ratio = p4.slider("Replay ratio per mini-batch", 0.2, 2.0, 1.0, 0.1)
-st.caption(f"Labelled stream rows available: **{S.lp:,}** · 'New data' starts one PSI-window before the latest drift alert "
-           "(or at stream start if none). Online learning updates one sample at a time (latest ≤1500). "
-           "Preprocessing is kept fixed so every model shares one feature space.")
-msg = compat(method)
-if msg:
-    st.warning(msg)
-if st.button("🔁 Train candidate model", disabled=bool(msg) or S.lp < 30):
-    try:
-        with st.spinner("Training candidate…"):
-            S.cand = train_candidate(strategy, method, int(W), int(epochs), 64, int(replay_n), ratio)
-    except Exception as e:
-        st.error(f"Retraining failed: {e}")
-if S.lp < 30:
-    st.info("Run the stream until at least 30 labels have arrived to enable retraining.")
-
-# 4 ─ comparison & decision
-st.header("4 · Before / after comparison & model decision")
-cd = S.cand
-if cd is None:
-    st.info("Train a candidate to compare it against the current model on the fixed held-out sets.")
+st.header("3 · Retrain the model")
+if S.events:
+    st.warning("Drift was detected, so retraining may help. Nothing is retrained automatically — click **Retrain Model** when you are ready.")
 else:
-    st.caption(f"Candidate: **{cd['method']}** · **{cd['strategy']}** · trained on {cd['n']:,} rows. "
-               "Evaluated on fixed held-out data that no model was trained on.")
+    st.caption("No drift alert so far. You can still retrain at any time once labelled rows have arrived.")
+st.caption(f"Labelled rows available so far: **{S.lp:,}** (as of the last page refresh). Only rows whose labels have already arrived are ever used.")
+r1, r2 = st.columns(2)
+strategy = r1.radio("Which data should the new model learn from?", STRATS)
+r1.caption({STRATS[0]: "Only rows that arrived since drift was noticed (or since the stream began).",
+            STRATS[1]: "The original training data plus all newly arrived labelled rows.",
+            STRATS[2]: "Only the most recent labelled rows."}[strategy])
+W = r1.number_input("How many recent rows?", 50, 20000, 500, 50) if strategy == STRATS[2] else 500
+methods = available_methods(strategy, int(W))
+method = r2.selectbox("How should the model be updated?", methods, format_func=lambda m: METHOD_INFO[m][0])
+r2.info(METHOD_INFO[method][1])
+if len(methods) < len(METHOD_INFO):
+    r2.caption(f"Some options are hidden because they are not supported by the {S.model_name} or the currently selected data.")
+with st.expander("Advanced options (optional)"):
+    a1, a2, a3 = st.columns(3)
+    epochs = a1.number_input("Passes over the data", 1, 20, 3)
+    replay_n = a2.number_input("Old rows to re-practise (replay buffer)", 50, 20000, 500, 50)
+    ratio = a3.slider("Old rows mixed in per batch", 0.2, 2.0, 1.0, 0.1)
+done = False
+if st.button("🔁 Retrain Model", type="primary"):
+    if S.lp < 30:
+        st.error("Not enough labelled rows yet — let the stream run a little longer, then try again.")
+    else:
+        try:
+            with st.spinner("Retraining…"):
+                run_retrain(strategy, method, int(W), int(epochs), 64, int(replay_n), ratio)
+            done = True
+        except Exception as e:
+            st.error(f"Retraining failed: {e}")
+if done:
+    st.rerun()
+
+# 4 ─ before / after
+st.header("4 · Before vs after")
+lr = S.last_retrain
+if lr is None:
+    st.info("After you retrain, the new model starts predicting immediately and its performance is compared with the old one here.")
+else:
+    st.success(f"✅ **Model updated** at row {lr['at']:,}: now serving **{lr['after_label']}** (previously {lr['before_label']}), "
+               f"trained on {lr['n']:,} labelled rows.")
+    cu, nw = lr["cur"]["recent"], lr["new"]["recent"]
+    if cu is None:
+        st.info("Too few labelled hold-out rows have arrived to compare fairly (need at least 10), so we cannot say whether the new model is better.")
+    else:
+        da, d_f1 = nw["Accuracy"] - cu["Accuracy"], nw["F1"] - cu["F1"]
+        if da > 0.01 and d_f1 > 0.01:
+            st.success(f"On recent labelled hold-out data, accuracy ({da:+.3f}) and F1 ({d_f1:+.3f}) both improved.")
+        elif da < -0.01 or d_f1 < -0.01:
+            st.warning(f"The new model did **not** improve: accuracy {da:+.3f}, F1 {d_f1:+.3f} on recent labelled hold-out data.")
+        else:
+            st.info(f"No meaningful difference on recent labelled hold-out data (accuracy {da:+.3f}, F1 {d_f1:+.3f}).")
+        if lr["n_recent"] < 30:
+            st.caption(f"Only {lr['n_recent']} hold-out rows were available, so treat this comparison with caution.")
+    st.caption("Evaluation uses hold-out rows that were never used for training and whose labels had already arrived at retraining time.")
     t1, t2 = st.columns(2)
-    for col, key, title in ((t1, "recent", "Recent hold-out (post-baseline period)"), (t2, "hist", "Retained historical hold-out")):
-        tbl = tmap({"Current": cd["cur"][key], "Candidate": cd["new"][key]})
-        tbl.loc["Δ (cand − cur)"] = (tbl.loc["Candidate"] - tbl.loc["Current"]).round(4)
+    for col, key, title in ((t1, "recent", "Recent labelled hold-out"), (t2, "hist", "Older (historical) hold-out")):
+        b_, a_ = lr["cur"][key], lr["new"][key]
+        if b_ is None:
+            continue
+        tbl = tmap({"Before (old model)": b_, "After (new model)": a_})
+        tbl.loc["Change"] = (tbl.loc["After (new model)"] - tbl.loc["Before (old model)"]).round(4)
         col.subheader(title)
         col.dataframe(tbl, use_container_width=True)
-    forget = cd["new"]["hist"]["Accuracy"] - cd["cur"]["hist"]["Accuracy"]
-    st.caption(f"Performance on retained historical data changed by {forget:+.3f} accuracy "
-               + ("(possible forgetting)." if forget < -0.02 else "(no notable forgetting)."))
-    q = st.columns(4)
-    q[0].plotly_chart(cm_fig(cd["cur"]["recent"]["cm"], "Current · recent"), use_container_width=True)
-    q[1].plotly_chart(cm_fig(cd["new"]["recent"]["cm"], "Candidate · recent"), use_container_width=True)
-    q[2].plotly_chart(cm_fig(cd["cur"]["hist"]["cm"], "Current · historical"), use_container_width=True)
-    q[3].plotly_chart(cm_fig(cd["new"]["hist"]["cm"], "Candidate · historical"), use_container_width=True)
-    a1, a2, _ = st.columns([1, 1, 3])
-    if a1.button("✅ Accept candidate", type="primary"):
-        S.version += 1
-        S.model_label = f"v{S.version} · {cd['method']} · {cd['strategy']}"
-        S.model = cd["model"]
-        S.adwin = ADWIN(delta=S.cfg["delta"])  # restart error monitoring for the new model
-        S.decisions.append(dict(decision="accepted", model=S.model_label, recent_F1=round(cd["new"]["recent"]["F1"], 4)))
-        S.cand = None
-        st.rerun()
-    if a2.button("❌ Reject candidate"):
-        S.decisions.append(dict(decision="rejected", model=f"{cd['method']} · {cd['strategy']}", recent_F1=round(cd["new"]["recent"]["F1"], 4)))
-        S.cand = None
-        st.rerun()
+    hd = lr["new"]["hist"]["Accuracy"] - lr["cur"]["hist"]["Accuracy"]
+    st.caption(f"Older-data accuracy changed by {hd:+.3f}" + (" — the model may be forgetting older patterns." if hd < -0.02 else "."))
+    if cu is not None:
+        q = st.columns(4)
+        q[0].plotly_chart(cm_fig(cu["cm"], "Before · recent"), use_container_width=True, key="cm1")
+        q[1].plotly_chart(cm_fig(nw["cm"], "After · recent"), use_container_width=True, key="cm2")
+        q[2].plotly_chart(cm_fig(lr["cur"]["hist"]["cm"], "Before · historical"), use_container_width=True, key="cm3")
+        q[3].plotly_chart(cm_fig(lr["new"]["hist"]["cm"], "After · historical"), use_container_width=True, key="cm4")
 
 st.subheader("Current model status")
-s1, s2, s3 = st.columns(3)
+s1, s2 = st.columns(2)
 s1.metric("Serving model", S.model_label)
-s2.metric("Accepted retrains", sum(d["decision"] == "accepted" for d in S.decisions))
-s3.metric("Rejected candidates", sum(d["decision"] == "rejected" for d in S.decisions))
-st.caption(f"Base estimator: {S.model_name}. Rejected candidates are discarded; the previous model keeps serving the stream.")
-if S.decisions:
-    st.dataframe(pd.DataFrame(S.decisions), use_container_width=True, hide_index=True)
+s2.metric("Times retrained", len(S.retrains))
+st.caption(f"Base estimator: {S.model_name}.")
+if S.retrains:
+    st.dataframe(pd.DataFrame(S.retrains), use_container_width=True, hide_index=True)
