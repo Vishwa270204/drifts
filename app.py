@@ -8,7 +8,7 @@ import streamlit as st
 import drift_core as core
 from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 
-CSV_PATH = Path(__file__).resolve().parent / "sensor.csv"   # keep it next to app.py
+CSV_PATH = Path(__file__).resolve().parent / "concept_drift_stream.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 CHART_H = 270         # full-width error chart
 CSS = """<style>
@@ -315,6 +315,8 @@ def main():
     # ---- header
     h, p_set = st.columns([6, 1.4], vertical_alignment="center")
     h.markdown('<h1 class="app-title">📈 Model Drift Dashboard</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="app-sub">Watch a deployed model for drift and decide when to update it.</p>',
+                unsafe_allow_html=True)
     if S is not None:
         with p_set:
             settings_panel(S)                       # compact popover once monitoring has started
