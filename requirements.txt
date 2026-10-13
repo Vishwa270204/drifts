@@ -1,5 +1,6 @@
 streamlit>=1.50
-river==0.26.1
-pandas>=2.0
-numpy>=1.26
-plotly>=5.20
+river
+pandas
+numpy
+plotly
+sklearn
