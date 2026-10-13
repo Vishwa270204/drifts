@@ -11,7 +11,7 @@ from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 CSV_PATH = Path(__file__).resolve().parent / "sensor.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 CSS = """<style>
-.block-container{padding-top:2.6rem;padding-bottom:.8rem;max-width:1400px}
+.block-container{padding-top:2.6rem;padding-bottom:.8rem;max-width:1100px}
 [data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.35rem .8rem}
 [data-testid="stMetricValue"]{font-size:1.7rem}
 [data-testid="stVerticalBlock"]{gap:.6rem}
@@ -96,15 +96,23 @@ def settings_panel(S):
 
 
 # ------------------------------------------------------------------ run controls, status, help
+def advance(S, n):
+    """Run n batches (None = until a decision). Detector failures are shown instead of crashing the page."""
+    try:
+        S.run(n)
+    except core.DetectorError as exc:
+        st.error(f"Drift detector error: {exc}")
+
+
 def controls(S):
     off = not S.can_advance
     a, b, c, d = st.columns([3, 1.2, 1.4, 1])
     if a.button("▶ Run until a decision is needed", type="primary", disabled=off, key="run_all", width="stretch"):
-        S.run(None)
+        advance(S, None)
     if b.button("Next batch", disabled=off, key="run_1", width="stretch"):
-        S.run(1)
+        advance(S, 1)
     if c.button("Next 10 batches", disabled=off, key="run_10", width="stretch"):
-        S.run(10)
+        advance(S, 10)
     if d.button("Reset", key="reset", width="stretch"):
         if S.k > 0:
             st.session_state["confirm_reset"] = True
@@ -123,17 +131,22 @@ def status_line(S):
 
 
 def how_it_works(S):
-    z = S.cfg.z if S else 3.0
-    B = S.cfg.B if S else 100
+    delta = S.cfg.adwin if S else core.SENS["Medium"]
     mn = S.cfg.min_rows if S else 400
     with st.popover("ℹ️ How it works"):
         st.markdown(f"""
 **How drift is detected**
-1. The first 40% of rows train the model; its error on the last fifth of that part sets the *normal* error level.
-2. Remaining rows arrive in batches of {B}. Each batch is scored by the deployed model.
-3. A batch is **bad** if its error is above `normal + {z:g} × spread / √rows` (the dashed red line).
-4. **Two bad batches in a row** raise a drift alert. The app then keeps collecting labelled rows until
-   {mn:,} new ones exist. If error returns to normal for 3 batches, the alert clears itself.
+1. When a batch's labels arrive, the deployed model's prediction errors for that batch are fed, once and in order,
+   to an **ADWIN** detector (confidence δ = {delta:g}). Errors are 1 = wrong, 0 = right; for regression the absolute
+   error, scaled to 0–1.
+2. ADWIN keeps a sliding window of recent errors and cuts it when two parts of the window differ significantly.
+   There is **no fixed error threshold**. δ is a confidence level: smaller means stricter, fewer and later alerts.
+3. A significant **rise** in error raises an alert straight away. A fall is ignored, or clears an open alert.
+4. The app estimates when the change began, then waits for {mn:,} new labelled rows before comparing models.
+5. The detector restarts after you update or keep, so it learns the new normal. Only batches scored by the
+   current model are used.
+
+The tree's own internal ADWIN is separate: it only acts while the tree learns, when you choose *Update model*.
 
 **How the recommendation is made**
 1. The newest 25% of the new labelled rows are **held out**.
@@ -141,23 +154,27 @@ def how_it_works(S):
 3. Current and updated models are both scored on the held-out rows. Lower error wins; a tie goes to *keep*.
 4. A warning appears if the test sample is small, one class dominates, or the gain is within noise.
 
-If you update, the model learns from **all** new rows and the alert threshold is reset from its held-out errors.
+If you update, the model learns from **all** new rows.
 """)
 
 
 # ------------------------------------------------------------------ chart
 def drift_chart(S, height=330):
-    n = min(S.k, len(S.ver), len(S.errs), len(S.thr))
-    xs, ver = np.arange(1, n + 1), np.asarray(S.ver)[:n]
-    errs, thr = np.asarray(S.errs, float)[:n], np.asarray(S.thr, float)[:n]
+    n = min(S.k, len(S.ver), len(S.errs))
+    xs, ver, errs = np.arange(1, n + 1), np.asarray(S.ver)[:n], np.asarray(S.errs, float)[:n]
     pct = S.task == "classification"
     fig = go.Figure()
     for i, v in enumerate(sorted(np.unique(ver))):
         idx = np.flatnonzero(ver == v)
         fig.add_trace(go.Scatter(x=xs[idx], y=errs[idx], mode="lines+markers", name=f"Model v{v}",
                                  line=dict(color=PALETTE[i % len(PALETTE)], width=2), marker=dict(size=5)))
-    fig.add_trace(go.Scatter(x=xs, y=thr, mode="lines", name="Alert threshold",
-                             line=dict(dash="dash", color="#c62828", width=1.5)))
+    for direction, label, color, symbol in (("up", "ADWIN: error rose", "#c62828", "diamond"),
+                                            ("down", "ADWIN: error fell", "#2e7d32", "diamond-open")):
+        js = [g["batch"] for g in S.signals if g["dir"] == direction and g["batch"] < n]
+        if js:
+            fig.add_trace(go.Scatter(x=[j + 1 for j in js], y=errs[js], mode="markers", name=label,
+                                     marker=dict(color=color, symbol=symbol, size=13,
+                                                 line=dict(width=2, color=color))))
     for r in S.retrains:
         if 1 <= r.applied + 1 <= n:
             fig.add_vline(x=r.applied + 1, line_color="#2e7d32", line_width=1.5,
@@ -184,7 +201,9 @@ def decision_panel(S):
                 flash("info", S.keep("not enough data to compare"))
                 st.rerun()
             return
-        st.write(f"Error was above the alert threshold for 2 batches in a row, from **batch {S.alert.start + 1}**.")
+        al = S.alert
+        st.write(f"ADWIN flagged a rise in error at **batch {al.detected + 1}**"
+                 + ("." if al.start == al.detected else f", and the change began around **batch {al.start + 1}**."))
         can_update = UPDATE in d.scores and np.isfinite(d.scores[UPDATE])
         cur = fmt_score(d.metric, d.scores[KEEP])
         a, b = st.columns(2)
@@ -256,21 +275,26 @@ def main():
         lvl, txt = st.session_state.pop("flash")
         getattr(st, lvl)(txt)
 
-    if S.ready:                                   # chart left, decision right: fits one screen
+    if S.k:
+        drift_chart(S, 340)
+
+    # Fixed slot below the chart: always present, so nothing shifts or pops up when a decision is needed.
+    if S.ready:
         with st.spinner("Comparing models on the newest data..."):
             S.ensure_decision()
-        left, right = st.columns([1.25, 1])
-        with left:
-            drift_chart(S, 380)
-        with right:
-            decision_panel(S)
+        decision_panel(S)
     else:
-        if S.k:
-            drift_chart(S, 340)
-        if S.alert and S.alert.status == "waiting":
-            st.progress(min(S.new_rows / S.cfg.min_rows, 1.0),
-                        text=f"Possible drift since batch {S.alert.start + 1}. Collecting new labelled data: "
-                             f"{S.new_rows:,} / {S.cfg.min_rows:,} rows")
+        with st.container(border=True):
+            if S.alert:
+                st.markdown("**Decision: not yet.** Possible drift since batch "
+                            f"{S.alert.start + 1}; collecting new labelled data.")
+                st.progress(min(S.new_rows / S.cfg.min_rows, 1.0),
+                            text=f"{S.new_rows:,} / {S.cfg.min_rows:,} new labelled rows")
+            elif S.done:
+                st.markdown("**Decision: none pending.** All batches have been processed.")
+            else:
+                st.markdown("**Decision: none needed.** Error is within the normal range. "
+                            "You will be asked here if drift is confirmed.")
     results_panel(S)
 
 
