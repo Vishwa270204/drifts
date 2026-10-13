@@ -20,7 +20,7 @@ footer,#MainMenu{visibility:hidden}
 /* headings */
 h3{padding:0!important;margin:0!important;font-size:1.2rem!important;line-height:1.5!important}
 .app-title{font-size:2.6rem!important;font-weight:800!important;line-height:1.2!important;margin:0!important;padding:0!important;white-space:nowrap}
-.app-sub{opacity:.7;font-size:1.05rem;margin:0}
+.app-sub{opacity:.7;font-size:1.05rem;margin:0 0 .6rem 0;padding-top:.2rem}
 .sec{font-size:.78rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;opacity:.6;margin:.1rem 0 0 0}
 
 /* KPI cards */
@@ -35,7 +35,7 @@ h3{padding:0!important;margin:0!important;font-size:1.2rem!important;line-height
 [data-testid="stTabs"] [role="tablist"]{margin-bottom:-.2rem}
 
 /* equal-height bottom panels */
-.st-key-decision_box,.st-key-history_box{min-height:410px}
+.st-key-decision_box,.st-key-history_box{min-height:380px}
 .st-key-decision_box [data-testid="stVerticalBlock"]{gap:.75rem}
 .st-key-decision_box h3,.st-key-history_box h3{margin-bottom:.3rem!important}
 
@@ -313,9 +313,9 @@ def main():
 
     # ---- header
     h, p_set = st.columns([6, 1.4], vertical_alignment="center")
-    h.markdown('<h1 class="app-title">📈 Model Drift Dashboard</h1>'
-               '<p class="app-sub">Watch a deployed model for drift and decide when to update it.</p>',
-               unsafe_allow_html=True)
+    h.markdown('<h1 class="app-title">📈 Model Drift Dashboard</h1>', unsafe_allow_html=True)
+    st.markdown('<p class="app-sub">Watch a deployed model for drift and decide when to update it.</p>',
+                unsafe_allow_html=True)
     if S is not None:
         with p_set:
             settings_panel(S)                       # compact popover once monitoring has started
