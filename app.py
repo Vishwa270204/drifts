@@ -21,7 +21,7 @@ footer,#MainMenu{visibility:hidden}
 h3{padding:0!important;margin:0!important;font-size:1.2rem!important;line-height:1.5!important}
 .app-title{font-size:2.6rem!important;font-weight:800!important;line-height:1.2!important;margin:0!important;padding:0!important;white-space:nowrap}
 .app-sub{opacity:.7;font-size:1.05rem;margin:0 0 .6rem 0;padding-top:.2rem}
-.sec{font-size:.78rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;opacity:.6;margin:.1rem 0 0 0}
+.sec{font-size:1.05rem;font-weight:700;letter-spacing:.02em;opacity:.9;margin:.6rem 0 .4rem 0;line-height:1.6}
 
 /* KPI cards */
 [data-testid="stMetric"]{background:rgba(128,128,128,.06);border:1px solid rgba(128,128,128,.18);
@@ -116,6 +116,7 @@ def settings_panel(S):
             try:
                 with st.spinner("Training the first model..."):
                     st.session_state["S"] = Session.create(df, target, tcol, task, Config.simple(batch, sens))
+                    advance(st.session_state["S"], 1)       # show the first batch on the chart right away
             except ValueError as exc:
                 st.error(str(exc))
                 return
