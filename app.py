@@ -11,17 +11,16 @@ from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 CSV_PATH = Path(__file__).resolve().parent / "concept_drift_stream.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 CHART_H = 270         # full-width error chart
-PANEL_H = 340         # decision panel and history panel share this height, so they always line up
 CSS = """<style>
 /* page frame: full width, small margins, clear of Streamlit's toolbar */
-.block-container{padding:3.2rem 1.5rem .3rem 1.5rem;max-width:100%}
+.block-container{padding:4.5rem 1.5rem 2rem 1.5rem;max-width:100%}
 footer,#MainMenu{visibility:hidden}
 [data-testid="stVerticalBlock"]{gap:.45rem}
 
 /* headings */
 h3{padding:0!important;margin:0!important;font-size:1.2rem!important;line-height:1.5!important}
-.app-title{font-size:1.5rem;font-weight:700;line-height:1.2;margin:0}
-.app-sub{opacity:.65;font-size:.85rem;margin:0}
+.app-title{font-size:2.6rem;font-weight:800;line-height:1.25;margin:0 0 .15rem 0;white-space:nowrap}
+.app-sub{opacity:.7;font-size:1.05rem;margin:0}
 .sec{font-size:.78rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;opacity:.6;margin:.1rem 0 0 0}
 
 /* KPI cards */
@@ -160,37 +159,6 @@ def kpi_strip(S):
     c4.metric("Model updates", len(S.retrains))
 
 
-def how_it_works(S):
-    delta = S.cfg.adwin if S else core.SENS["Medium"]
-    mn = S.cfg.min_rows if S else 400
-    with st.popover("ℹ️ How it works", width="stretch"):
-        st.markdown(f"""
-**How drift is detected**
-1. When a batch's labels arrive, the deployed model's prediction errors for that batch are fed, once and in order,
-   to an **ADWIN** detector (confidence δ = {delta:g}). Errors are 1 = wrong, 0 = right; for regression the absolute
-   error, scaled to 0–1.
-2. ADWIN keeps a sliding window of recent errors and cuts it when two parts of the window differ significantly.
-   There is **no fixed error threshold**. δ is a confidence level: smaller means stricter, fewer and later alerts.
-   The dashed red line is the error level ADWIN currently treats as normal (its window average), not a limit:
-   an alert fires when recent errors differ from it significantly, and that distance depends on how much data
-   ADWIN has seen.
-3. A significant **rise** in error raises an alert straight away. A fall is ignored, or clears an open alert.
-4. The app estimates when the change began, then waits for {mn:,} new labelled rows before comparing models.
-5. The detector restarts after you update or keep, so it learns the new normal. Only batches scored by the
-   current model are used.
-
-The tree's own internal ADWIN is separate: it only acts while the tree learns, when you choose *Update model*.
-
-**How the recommendation is made**
-1. The newest 25% of the new labelled rows are **held out**.
-2. A copy of the current model keeps learning from the rest of the new rows.
-3. Current and updated models are both scored on the held-out rows. Lower error wins; a tie goes to *keep*.
-4. A warning appears if the test sample is small, one class dominates, or the gain is within noise.
-
-If you update, the model learns from **all** new rows.
-""")
-
-
 # ------------------------------------------------------------------ chart
 def drift_chart(S, height=CHART_H):
     n = min(S.k, len(S.ver), len(S.errs))
@@ -232,7 +200,7 @@ def drift_chart(S, height=CHART_H):
 # ------------------------------------------------------------------ bottom row: decision (left) + history (right)
 def decision_panel(S):
     d = S.cand
-    with st.container(border=True, height=PANEL_H):
+    with st.container(border=True):
         st.markdown("### ⚠️ Drift detected: your decision")
         if d.error:
             st.error(d.error)
@@ -278,7 +246,7 @@ def decision_panel(S):
 
 def idle_panel(S):
     """Same slot and height as the decision panel, so the layout never jumps."""
-    with st.container(border=True, height=PANEL_H):
+    with st.container(border=True):
         st.markdown("### Decision")
         if S.alert:
             st.markdown(f"**Not yet.** Possible drift since batch {S.alert.start + 1}; collecting new labelled data.")
@@ -293,7 +261,7 @@ def idle_panel(S):
 
 def results_panel(S):
     """Always rendered at the same height as the decision panel."""
-    with st.container(border=True, height=PANEL_H):
+    with st.container(border=True):
         st.markdown("### History")
         if not (S.retrains or S.events):
             st.caption("Nothing yet. Drift alerts and model updates will be listed here.")
@@ -304,10 +272,11 @@ def results_panel(S):
                 t = S.retrain_summary()
                 t[["Error before", "Error after"]] = t[["Error before", "Error after"]].round(4)
                 t["Change (%)"] = t["Change (%)"].round(1)
-                wide(st.dataframe, t, hide_index=True, height=min(35 * (len(t) + 1) + 3, 200))
+                wide(st.dataframe, t, hide_index=True, height=min(35 * (len(t) + 1) + 3, 320))
                 st.caption("Negative change = fewer errors after the update. Early numbers cover few batches.")
         with tabs[-1]:
-            wide(st.dataframe, pd.DataFrame(S.events), hide_index=True, height=215)
+            ev = pd.DataFrame(S.events)
+            wide(st.dataframe, ev, hide_index=True, height=min(35 * (len(ev) + 1) + 3, 320))
 
 
 # ------------------------------------------------------------------ main
@@ -331,12 +300,10 @@ def main():
         st.toast("The app was updated, so the previous session was reset. Please start monitoring again.")
 
     # ---- header
-    h, p_set, p_help = st.columns([6, 1.2, 1.4])
+    h, p_set = st.columns([6, 1.4])
     h.markdown('<p class="app-title">📈 Model Drift Dashboard</p>'
                '<p class="app-sub">Watch a deployed model for drift and decide when to update it.</p>',
                unsafe_allow_html=True)
-    with p_help:
-        how_it_works(S)
     if S is not None:
         with p_set:
             settings_panel(S)                       # compact popover once monitoring has started
