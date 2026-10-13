@@ -1,6 +1,6 @@
-streamlit
-plotly
-river
-scikit-learn
+streamlit>=1.40
 pandas
 numpy
+scikit-learn
+plotly
+river
