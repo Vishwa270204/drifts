@@ -1,10 +1,4 @@
-"""Model Drift Dashboard: Streamlit UI.
 
-All modelling, drift detection and decision logic lives in `drift_core.py`; this file only renders state and
-forwards user actions to a `drift_core.Session`.
-
-Run with:  streamlit run app.py      (requires: pip install streamlit plotly river scikit-learn pandas)
-"""
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +9,7 @@ import streamlit as st
 import drift_core as core
 from drift_core import KEEP, REG, STRATEGIES, Config, Session
 
-CSV_PATH = Path(__file__).parent / "synthetic_iot_sensor_data.csv"   # keep it next to app.py
+CSV_PATH = Path(__file__).parent / "concept_drift_stream.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 CSS = """<style>
 .block-container{padding-top:1.4rem;padding-bottom:1.5rem}
