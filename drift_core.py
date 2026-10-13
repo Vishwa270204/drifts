@@ -436,6 +436,7 @@ class Session:
     batch_e: list = field(default_factory=list)     # per-row errors of each batch (kept until labels arrive)
     last_fed: int = -1              # last batch given to ADWIN; guarantees no batch is fed twice
     signals: list = field(default_factory=list)     # ADWIN detections: {"batch", "dir": "up" | "down"}
+    levels: dict = field(default_factory=dict)      # batch -> ADWIN window mean (error units) after that batch
     alert: Optional[Alert] = None
     snooze_until: int = 0
     cand: Optional[Decision] = None
@@ -579,6 +580,8 @@ class Session:
         except Exception as exc:
             raise DetectorError(f"The ADWIN detector failed on batch {j + 1}: {exc}") from exc
         self.last_fed = j
+        if float(self.det.width) > 0:                      # window mean = the error level ADWIN treats as normal
+            self.levels[j] = float(self.det.estimation) * self.err_scale
         if ups:
             self.signals.append({"batch": j, "dir": "up"})
         if downs:
