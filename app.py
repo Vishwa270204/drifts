@@ -35,9 +35,9 @@ h3{padding:0!important;margin:0!important;font-size:1.2rem!important;line-height
 [data-testid="stTabs"] [role="tablist"]{margin-bottom:-.2rem}
 
 /* equal-height bottom panels */
-.st-key-decision_box,.st-key-history_box{min-height:380px}
+.st-key-decision_box,.st-key-history_box_on{min-height:380px}
 .st-key-decision_box [data-testid="stVerticalBlock"]{gap:.75rem}
-.st-key-decision_box h3,.st-key-history_box h3{margin-bottom:.3rem!important}
+.st-key-decision_box h3,[class*="st-key-history_box"] h3,.st-key-idle_box h3{margin-bottom:.3rem!important}
 
 /* blue for actions; red is kept for drift only */
 button[data-testid="stBaseButton-primary"]{background-color:#1f6fb2!important;border-color:#1f6fb2!important;color:#fff!important}
@@ -258,7 +258,7 @@ def decision_panel(S):
 
 def idle_panel(S):
     """Same slot and height as the decision panel, so the layout never jumps."""
-    with st.container(border=True, key="decision_box"):
+    with st.container(border=True, key="idle_box"):
         st.markdown("### Decision")
         if S.alert:
             st.markdown(f"**Not yet.** Possible drift since batch {S.alert.start + 1}; collecting new labelled data.")
@@ -273,7 +273,7 @@ def idle_panel(S):
 
 def results_panel(S):
     """Always rendered at the same height as the decision panel."""
-    with st.container(border=True, key="history_box"):
+    with st.container(border=True, key="history_box_on" if S.ready else "history_box_off"):
         st.markdown("### History")
         if not (S.retrains or S.events):
             st.caption("Nothing yet. Drift alerts and model updates will be listed here.")
@@ -340,7 +340,7 @@ def main():
     if S.k:
         drift_chart(S)
     else:
-        with st.container(border=True, height=CHART_H):
+        with st.container(border=True, height=110):
             st.caption("The error chart appears here. Press **Run** or **Next batch**.")
 
     # ---- bottom row: decision | history (equal height, always aligned)
