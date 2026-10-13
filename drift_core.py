@@ -400,6 +400,9 @@ def adwin_update(det, x: float) -> bool:
 # ======================================================================
 # session
 # ======================================================================
+SCHEMA = 3   # bump when Session's fields change; the UI discards sessions created by older code
+
+
 @dataclass
 class Alert:
     start: int                      # estimated first batch of the change (from ADWIN's window cut)
@@ -688,3 +691,6 @@ class Session:
                          "Change (%)": (a - b) / b * 100 if np.isfinite(b) and b > 1e-12 and np.isfinite(a)
                          else np.nan})
         return pd.DataFrame(rows)
+
+
+Session.SCHEMA = SCHEMA
