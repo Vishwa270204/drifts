@@ -153,10 +153,10 @@ def retrain_results(S: Session):
                f"({S.unit}). Early live numbers cover few batches, so read them with care.")
 
 
-# ------------------------------------------------------------------ sidebar
-def sidebar_config(S):
-    with st.sidebar:
-        st.header("Configuration")
+# ------------------------------------------------------------------ configuration (top of the page)
+def config_panel(S):
+    with st.container(border=True):
+        st.subheader("Configuration")
         if not CSV_PATH.exists():
             st.error(f"Data file not found: `{CSV_PATH.name}`. Put it in the same folder as app.py.")
             return
@@ -165,39 +165,44 @@ def sidebar_config(S):
         except Exception as exc:
             st.error(str(exc))
             return
-        st.caption(f"Data: `{CSV_PATH.name}` ({len(df):,} rows). Rows should be in time order, or pick a time column.")
-        target = st.selectbox("Target column", df.columns, index=len(df.columns) - 1)
-        tcol = st.selectbox("Time column (optional)", ["(row order)"] + [c for c in df.columns if c != target])
-        st.caption("Model: Hoeffding Adaptive Tree (river), learns one row at a time and adapts to drift internally.")
+        st.caption(f"Data: `{CSV_PATH.name}` ({len(df):,} rows). Model: Hoeffding Adaptive Tree (river), learns one "
+                   "row at a time. Rows should be in time order, or pick a time column.")
+        c1, c2, c3 = st.columns(3)
+        target = c1.selectbox("Target column", df.columns, index=len(df.columns) - 1)
+        tcol = c2.selectbox("Time column (optional)", ["(row order)"] + [c for c in df.columns if c != target])
         tasks = ["classification", "regression"]
-        task = st.radio("Task", tasks, index=tasks.index(core.guess_task(df, target)), horizontal=True)
-        train_pct = st.slider("Initial training %", 20, 70, 40, 5)
-        B = int(st.number_input("Batch size (rows)", 20, 5000, 100))
-        sens = st.selectbox("Drift sensitivity", list(core.SENS), index=1)
-        delay = int(st.number_input("Label delay (batches)", 0, 20, 0))
-        min_rows = int(st.number_input("Min new labelled rows before asking", 100, 100000, 300,
+        task = c3.radio("Task", tasks, index=tasks.index(core.guess_task(df, target)), horizontal=True)
+        c1, c2, c3 = st.columns(3)
+        train_pct = c1.slider("Initial training %", 20, 70, 40, 5)
+        B = int(c2.number_input("Batch size (rows)", 20, 5000, 100))
+        sens = c3.selectbox("Drift sensitivity", list(core.SENS), index=1)
+        c1, c2, c3 = st.columns(3)
+        delay = int(c1.number_input("Label delay (batches)", 0, 20, 0))
+        min_rows = int(c2.number_input("Min new labelled rows before asking", 100, 100000, 300,
                                        help="After a drift alert, monitoring continues until this many post-drift "
                                             "labelled rows exist."))
-        snooze = int(st.number_input("Snooze after 'keep' (batches)", 0, 200, 10))
+        snooze = int(c3.number_input("Snooze after 'keep' (batches)", 0, 200, 10))
         with st.expander("Advanced settings"):
-            hold_frac = st.slider("Share of new labelled rows held out for evaluation", 0.10, 0.40, 0.25, 0.05)
-            metric = st.selectbox("Selection metric (lower is better)", core.METRICS[task])
+            c1, c2 = st.columns(2)
+            hold_frac = c1.slider("Share of new labelled rows held out for evaluation", 0.10, 0.40, 0.25, 0.05)
+            metric = c2.selectbox("Selection metric (lower is better)", core.METRICS[task])
             pos = None
             if task == "classification":
                 labs, dflt = core.class_options(df[target])
                 if labs:
-                    pos = st.selectbox("Fault (positive) class", labs, index=labs.index(dflt))
+                    pos = c1.selectbox("Fault (positive) class", labs, index=labs.index(dflt))
             st.markdown("**Hoeffding Adaptive Tree settings**")
-            grace = int(st.number_input("Grace period (rows between split attempts)", 10, 5000, 200, step=10,
+            c1, c2, c3 = st.columns(3)
+            grace = int(c1.number_input("Grace period (rows between split attempts)", 10, 5000, 200, step=10,
                                         help="Lower = the tree splits sooner and adapts faster, but is noisier."))
-            delta = st.select_slider("Split confidence (delta, smaller = more cautious)", core.DELTAS, value=1e-7,
-                                     format_func=lambda v: f"{v:.0e}")
-            tau = st.number_input("Tie threshold (tau)", 0.001, 0.5, 0.05, step=0.01, format="%.3f")
-            adwin = st.select_slider("ADWIN sensitivity (larger = reacts to drift sooner)", core.ADWIN_DELTAS,
-                                     value=0.002, help="Confidence of the drift detector inside each tree node.")
-            win_thr = int(st.number_input("Alternate-tree window (rows)", 50, 5000, 300, step=50,
+            tau = c2.number_input("Tie threshold (tau)", 0.001, 0.5, 0.05, step=0.01, format="%.3f")
+            win_thr = int(c3.number_input("Alternate-tree window (rows)", 50, 5000, 300, step=50,
                                           help="Rows an alternate subtree must see before it can replace "
                                                "the original branch."))
+            delta = st.select_slider("Split confidence (delta, smaller = more cautious)", core.DELTAS, value=1e-7,
+                                     format_func=lambda v: f"{v:.0e}")
+            adwin = st.select_slider("ADWIN sensitivity (larger = reacts to drift sooner)", core.ADWIN_DELTAS,
+                                     value=0.002, help="Confidence of the drift detector inside each tree node.")
             seed = int(st.number_input("Random seed", 0, 10_000, 42))
         running = S is not None and S.k > 0
         go_ = False
@@ -225,16 +230,16 @@ def sidebar_config(S):
 
 # ------------------------------------------------------------------ main
 def main():
-    st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
     st.markdown(CSS, unsafe_allow_html=True)
     st.title("📈 Model Drift Dashboard")
     if not core.RIVER_OK:
         st.error("This app needs the `river` package. Install it with `pip install river` and restart.")
         st.stop()
-    sidebar_config(st.session_state.get("S"))
+    config_panel(st.session_state.get("S"))
     S = st.session_state.get("S")
     if S is None:
-        st.info("Choose your columns in the sidebar and click **Start monitoring**.")
+        st.info("Choose your columns above and click **Start monitoring**.")
         st.stop()
 
     off = not S.can_advance
