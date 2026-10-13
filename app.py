@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import drift_core as core
-from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
+#from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 
 CSV_PATH = Path(__file__).resolve().parent / "live_sensor_data.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
