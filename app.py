@@ -8,12 +8,14 @@ import streamlit as st
 import drift_core as core
 from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 
-CSV_PATH = Path(__file__).resolve().parent / "synthetic_iot_sensor_data.csv"   # keep it next to app.py
+CSV_PATH = Path(__file__).resolve().parent / "concept_drift_stream.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 CSS = """<style>
-.block-container{padding-top:1.6rem;padding-bottom:2rem;max-width:1100px}
-[data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.6rem .9rem}
-h1{font-size:1.8rem!important;padding-bottom:.2rem}
+.block-container{padding-top:2.6rem;padding-bottom:.8rem;max-width:1400px}
+[data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.35rem .8rem}
+[data-testid="stMetricValue"]{font-size:1.7rem}
+[data-testid="stVerticalBlock"]{gap:.6rem}
+h3{padding:0!important;margin:0!important}
 </style>"""
 _NEW_API = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit()) >= (1, 50)
 
@@ -93,17 +95,17 @@ def settings_panel(S):
             st.rerun()
 
 
-# ------------------------------------------------------------------ run controls and status
+# ------------------------------------------------------------------ run controls, status, help
 def controls(S):
     off = not S.can_advance
-    a, b, c, d = st.columns([2.6, 1, 1.2, 0.8])
-    if a.button("▶ Run until a decision is needed", type="primary", disabled=off, key="run_all"):
+    a, b, c, d = st.columns([3, 1.2, 1.4, 1])
+    if a.button("▶ Run until a decision is needed", type="primary", disabled=off, key="run_all", width="stretch"):
         S.run(None)
-    if b.button("Next batch", disabled=off, key="run_1"):
+    if b.button("Next batch", disabled=off, key="run_1", width="stretch"):
         S.run(1)
-    if c.button("Next 10 batches", disabled=off, key="run_10"):
+    if c.button("Next 10 batches", disabled=off, key="run_10", width="stretch"):
         S.run(10)
-    if d.button("Reset", key="reset"):
+    if d.button("Reset", key="reset", width="stretch"):
         if S.k > 0:
             st.session_state["confirm_reset"] = True
         else:
@@ -115,15 +117,36 @@ def controls(S):
         st.rerun()
 
 
-def status_row(S):
-    a, b, c = st.columns([3, 1, 1.4])
-    a.progress(S.k / S.nb if S.nb else 0.0, text=f"Batch {S.k} of {S.nb}")
-    b.metric("Model", f"v{S.version}")
-    c.metric("Status", S.status)
+def status_line(S):
+    st.progress(S.k / S.nb if S.nb else 0.0,
+                text=f"Batch {S.k} of {S.nb}   ·   Model v{S.version}   ·   {S.status}")
+
+
+def how_it_works(S):
+    z = S.cfg.z if S else 3.0
+    B = S.cfg.B if S else 100
+    mn = S.cfg.min_rows if S else 400
+    with st.popover("ℹ️ How it works"):
+        st.markdown(f"""
+**How drift is detected**
+1. The first 40% of rows train the model; its error on the last fifth of that part sets the *normal* error level.
+2. Remaining rows arrive in batches of {B}. Each batch is scored by the deployed model.
+3. A batch is **bad** if its error is above `normal + {z:g} × spread / √rows` (the dashed red line).
+4. **Two bad batches in a row** raise a drift alert. The app then keeps collecting labelled rows until
+   {mn:,} new ones exist. If error returns to normal for 3 batches, the alert clears itself.
+
+**How the recommendation is made**
+1. The newest 25% of the new labelled rows are **held out**.
+2. A copy of the current model keeps learning from the rest of the new rows.
+3. Current and updated models are both scored on the held-out rows. Lower error wins; a tie goes to *keep*.
+4. A warning appears if the test sample is small, one class dominates, or the gain is within noise.
+
+If you update, the model learns from **all** new rows and the alert threshold is reset from its held-out errors.
+""")
 
 
 # ------------------------------------------------------------------ chart
-def drift_chart(S):
+def drift_chart(S, height=330):
     n = min(S.k, len(S.ver), len(S.errs), len(S.thr))
     xs, ver = np.arange(1, n + 1), np.asarray(S.ver)[:n]
     errs, thr = np.asarray(S.errs, float)[:n], np.asarray(S.thr, float)[:n]
@@ -142,9 +165,9 @@ def drift_chart(S):
     if S.alert is not None and 1 <= S.alert.start + 1 <= n:
         fig.add_vrect(x0=S.alert.start + 1, x1=n, fillcolor="#c62828", opacity=0.07, line_width=0,
                       annotation_text="Drift", annotation_position="top left")
-    fig.update_layout(height=320, margin=dict(t=20, b=40, l=50, r=20), hovermode="x unified",
+    fig.update_layout(height=height, margin=dict(t=10, b=30, l=50, r=10), hovermode="x unified",
                       xaxis_title="Batch", yaxis_title="Error rate" if pct else "MAE",
-                      legend=dict(orientation="h", y=-0.25))
+                      legend=dict(orientation="h", y=-0.22))
     if pct:
         fig.update_yaxes(tickformat=".0%", rangemode="tozero")
     wide(st.plotly_chart, fig)
@@ -154,86 +177,100 @@ def drift_chart(S):
 def decision_panel(S):
     d = S.cand
     with st.container(border=True):
-        st.subheader("⚠️ Drift detected")
+        st.markdown("### ⚠️ Drift detected")
         if d.error:
             st.error(d.error)
             if st.button("Keep current model", key="skip_err"):
                 flash("info", S.keep("not enough data to compare"))
                 st.rerun()
             return
-        st.write(f"Error started rising at **batch {S.alert.start + 1}**. Both models were tested on the "
-                 f"**{d.hold}** most recent labelled rows (lower {d.metric.lower()} is better).")
+        st.write(f"Error was above the alert threshold for 2 batches in a row, from **batch {S.alert.start + 1}**.")
         can_update = UPDATE in d.scores and np.isfinite(d.scores[UPDATE])
+        cur = fmt_score(d.metric, d.scores[KEEP])
         a, b = st.columns(2)
-        a.metric("Current model", fmt_score(d.metric, d.scores[KEEP]))
+        a.metric("Current model", cur)
+        new = fmt_score(d.metric, d.scores[UPDATE]) if can_update else "n/a"
         if can_update:
             ch = d.change_pct(UPDATE)
-            b.metric("Updated model", fmt_score(d.metric, d.scores[UPDATE]),
-                     delta=None if np.isnan(ch) else f"{ch:+.1f}%", delta_color="inverse")
+            b.metric("Updated model", new, delta=None if np.isnan(ch) else f"{ch:+.1f}%", delta_color="inverse")
         else:
-            b.metric("Updated model", "n/a")
+            b.metric("Updated model", new)
+        st.caption(f"{d.metric}, measured on the {d.hold} newest labelled rows (lower is better).")
         rec_update = d.rec == UPDATE
         if rec_update:
-            st.success("**Recommended: update the model.** It does better on recent data.")
+            st.success(f"**Update the model.** It scores lower on recent data ({new} vs {cur}).")
         else:
-            st.info("**Recommended: keep the current model.** The update is not better on recent data.")
+            st.info("**Keep the current model.** The update is not better on recent data.")
         if d.notes:
             st.caption("⚠️ Take with care: " + "; ".join(d.notes) + ".")
-        c1, c2, _ = st.columns([1.4, 1.4, 2.2])
+        c1, c2 = st.columns(2)
         if c1.button("Update model", type="primary" if rec_update else "secondary", disabled=not can_update,
-                     key=f"apply_{S.k}"):
+                     key=f"apply_{S.k}", width="stretch"):
             ok, msg = S.apply(UPDATE)
             flash("success" if ok else "error", msg)
             st.rerun()
-        if c2.button("Keep current model", type="secondary" if rec_update else "primary", key=f"keep_{S.k}"):
+        if c2.button("Keep current model", type="secondary" if rec_update else "primary", key=f"keep_{S.k}",
+                     width="stretch"):
             flash("info", S.keep())
             st.rerun()
 
 
 def results_panel(S):
+    if not (S.retrains or S.events):
+        return
+    tabs = st.tabs(["Updated models: before vs after", "Event log"] if S.retrains else ["Event log"])
     if S.retrains:
-        st.subheader("Updated models: before vs after")
-        t = S.retrain_summary()
-        t[["Error before", "Error after"]] = t[["Error before", "Error after"]].round(4)
-        t["Change (%)"] = t["Change (%)"].round(1)
-        wide(st.dataframe, t, hide_index=True)
-        st.caption("Negative change = fewer errors after the update. Early numbers cover few batches.")
-    if S.events:
-        with st.expander("Event log"):
-            wide(st.dataframe, pd.DataFrame(S.events), hide_index=True)
+        with tabs[0]:
+            t = S.retrain_summary()
+            t[["Error before", "Error after"]] = t[["Error before", "Error after"]].round(4)
+            t["Change (%)"] = t["Change (%)"].round(1)
+            wide(st.dataframe, t, hide_index=True)
+            st.caption("Negative change = fewer errors after the update. Early numbers cover few batches.")
+    with tabs[-1]:
+        wide(st.dataframe, pd.DataFrame(S.events), hide_index=True, height=180)
 
 
 # ------------------------------------------------------------------ main
 def main():
-    st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="centered",
+    st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="wide",
                        initial_sidebar_state="collapsed")
     st.markdown(CSS, unsafe_allow_html=True)
-    st.title("📈 Model Drift Dashboard")
     if not core.RIVER_OK:
         st.error("This app needs the `river` package. Install it with `pip install river` and restart.")
         st.stop()
+    S = st.session_state.get("S")
+    h, p = st.columns([6, 1.3])
+    h.markdown("### 📈 Model Drift Dashboard")
+    with p:
+        how_it_works(S)
 
-    settings_panel(st.session_state.get("S"))
+    settings_panel(S)
     S = st.session_state.get("S")
     if S is None:
         st.info("Pick the target column above and click **Start monitoring**.")
         st.stop()
 
     controls(S)
-    status_row(S)
+    status_line(S)
     if st.session_state.get("flash"):
         lvl, txt = st.session_state.pop("flash")
         getattr(st, lvl)(txt)
-    if S.k:
-        drift_chart(S)
-    if S.alert and S.alert.status == "waiting":
-        st.progress(min(S.new_rows / S.cfg.min_rows, 1.0),
-                    text=f"Possible drift since batch {S.alert.start + 1}. Collecting new labelled data: "
-                         f"{S.new_rows:,} / {S.cfg.min_rows:,} rows")
-    if S.ready:
+
+    if S.ready:                                   # chart left, decision right: fits one screen
         with st.spinner("Comparing models on the newest data..."):
             S.ensure_decision()
-        decision_panel(S)
+        left, right = st.columns([1.25, 1])
+        with left:
+            drift_chart(S, 380)
+        with right:
+            decision_panel(S)
+    else:
+        if S.k:
+            drift_chart(S, 340)
+        if S.alert and S.alert.status == "waiting":
+            st.progress(min(S.new_rows / S.cfg.min_rows, 1.0),
+                        text=f"Possible drift since batch {S.alert.start + 1}. Collecting new labelled data: "
+                             f"{S.new_rows:,} / {S.cfg.min_rows:,} rows")
     results_panel(S)
 
 
