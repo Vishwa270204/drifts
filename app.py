@@ -10,11 +10,12 @@ from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 
 CSV_PATH = Path(__file__).resolve().parent / "sensor.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
+SLOT_H = 410          # chart and decision box share this height, so the page never shifts
 CSS = """<style>
-.block-container{padding-top:2.6rem;padding-bottom:.8rem;max-width:1100px}
-[data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.35rem .8rem}
-[data-testid="stMetricValue"]{font-size:1.7rem}
-[data-testid="stVerticalBlock"]{gap:.6rem}
+.block-container{padding-top:3rem;padding-bottom:.5rem;max-width:1300px}
+[data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.3rem .8rem}
+[data-testid="stMetricValue"]{font-size:1.6rem}
+[data-testid="stVerticalBlock"]{gap:.5rem}
 h3{padding:0!important;margin:0!important}
 </style>"""
 _NEW_API = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit()) >= (1, 50)
@@ -60,7 +61,8 @@ def load_data():
 
 # ------------------------------------------------------------------ settings: target, sensitivity, batch size
 def settings_panel(S):
-    with st.expander("Settings", expanded=S is None):
+    box = st.expander("Settings", expanded=True) if S is None else st.popover("⚙️ Settings", width="stretch")
+    with box:
         try:
             df, name = load_data()
         except Exception as exc:
@@ -141,6 +143,9 @@ def how_it_works(S):
    error, scaled to 0–1.
 2. ADWIN keeps a sliding window of recent errors and cuts it when two parts of the window differ significantly.
    There is **no fixed error threshold**. δ is a confidence level: smaller means stricter, fewer and later alerts.
+   The dashed red line is the error level ADWIN currently treats as normal (its window average), not a limit:
+   an alert fires when recent errors differ from it significantly, and that distance depends on how much data
+   ADWIN has seen.
 3. A significant **rise** in error raises an alert straight away. A fall is ignored, or clears an open alert.
 4. The app estimates when the change began, then waits for {mn:,} new labelled rows before comparing models.
 5. The detector restarts after you update or keep, so it learns the new normal. Only batches scored by the
@@ -159,7 +164,7 @@ If you update, the model learns from **all** new rows.
 
 
 # ------------------------------------------------------------------ chart
-def drift_chart(S, height=330):
+def drift_chart(S, height=SLOT_H):
     n = min(S.k, len(S.ver), len(S.errs))
     xs, ver, errs = np.arange(1, n + 1), np.asarray(S.ver)[:n], np.asarray(S.errs, float)[:n]
     pct = S.task == "classification"
@@ -168,6 +173,12 @@ def drift_chart(S, height=330):
         idx = np.flatnonzero(ver == v)
         fig.add_trace(go.Scatter(x=xs[idx], y=errs[idx], mode="lines+markers", name=f"Model v{v}",
                                  line=dict(color=PALETTE[i % len(PALETTE)], width=2), marker=dict(size=5)))
+    lv = sorted(j for j in S.levels if j < n)
+    if lv:                                          # ADWIN has no threshold; this is its current "normal" level
+        y = np.full(n, np.nan)
+        y[lv] = [S.levels[j] for j in lv]
+        fig.add_trace(go.Scatter(x=xs, y=y, mode="lines", name="ADWIN normal level", connectgaps=False,
+                                 line=dict(dash="dash", color="#c62828", width=1.5, shape="hv")))
     for direction, label, color, symbol in (("up", "ADWIN: error rose", "#c62828", "diamond"),
                                             ("down", "ADWIN: error fell", "#2e7d32", "diamond-open")):
         js = [g["batch"] for g in S.signals if g["dir"] == direction and g["batch"] < n]
@@ -182,9 +193,9 @@ def drift_chart(S, height=330):
     if S.alert is not None and 1 <= S.alert.start + 1 <= n:
         fig.add_vrect(x0=S.alert.start + 1, x1=n, fillcolor="#c62828", opacity=0.07, line_width=0,
                       annotation_text="Drift", annotation_position="top left")
-    fig.update_layout(height=height, margin=dict(t=10, b=30, l=50, r=10), hovermode="x unified",
+    fig.update_layout(height=height, margin=dict(t=30, b=35, l=50, r=10), hovermode="x unified",
                       xaxis_title="Batch", yaxis_title="Error rate" if pct else "MAE",
-                      legend=dict(orientation="h", y=-0.22))
+                      legend=dict(orientation="h", y=1.1, x=0))
     if pct:
         fig.update_yaxes(tickformat=".0%", rangemode="tozero")
     wide(st.plotly_chart, fig)
@@ -193,7 +204,7 @@ def drift_chart(S, height=330):
 # ------------------------------------------------------------------ decision
 def decision_panel(S):
     d = S.cand
-    with st.container(border=True):
+    with st.container(border=True, height=SLOT_H):
         st.markdown("### ⚠️ Drift detected")
         if d.error:
             st.error(d.error)
@@ -243,13 +254,28 @@ def results_panel(S):
             t = S.retrain_summary()
             t[["Error before", "Error after"]] = t[["Error before", "Error after"]].round(4)
             t["Change (%)"] = t["Change (%)"].round(1)
-            wide(st.dataframe, t, hide_index=True)
+            wide(st.dataframe, t, hide_index=True, height=min(38 * (len(t) + 1), 160))
             st.caption("Negative change = fewer errors after the update. Early numbers cover few batches.")
     with tabs[-1]:
-        wide(st.dataframe, pd.DataFrame(S.events), hide_index=True, height=180)
+        wide(st.dataframe, pd.DataFrame(S.events), hide_index=True, height=150)
 
 
 # ------------------------------------------------------------------ main
+def idle_panel(S):
+    """Same slot as the decision box, so the layout is identical before and after a decision is needed."""
+    with st.container(border=True, height=SLOT_H):
+        st.markdown("### Decision")
+        if S.alert:
+            st.markdown(f"**Not yet.** Possible drift since batch {S.alert.start + 1}; collecting new labelled data.")
+            st.progress(min(S.new_rows / S.cfg.min_rows, 1.0),
+                        text=f"{S.new_rows:,} / {S.cfg.min_rows:,} new labelled rows")
+        elif S.done:
+            st.markdown("**None pending.** All batches have been processed.")
+        else:
+            st.markdown("**None needed.** Error is within the normal range. You will be asked here if drift is "
+                        "confirmed.")
+
+
 def main():
     st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="wide",
                        initial_sidebar_state="collapsed")
@@ -258,12 +284,15 @@ def main():
         st.error("This app needs the `river` package. Install it with `pip install river` and restart.")
         st.stop()
     S = st.session_state.get("S")
-    h, p = st.columns([6, 1.3])
+    h, p_set, p_help = st.columns([5, 1.3, 1.5])
     h.markdown("### 📈 Model Drift Dashboard")
-    with p:
+    with p_help:
         how_it_works(S)
-
-    settings_panel(S)
+    if S is not None:
+        with p_set:
+            settings_panel(S)                       # compact popover once monitoring has started
+    else:
+        settings_panel(None)                        # full panel until the first start
     S = st.session_state.get("S")
     if S is None:
         st.info("Pick the target column above and click **Start monitoring**.")
@@ -275,26 +304,20 @@ def main():
         lvl, txt = st.session_state.pop("flash")
         getattr(st, lvl)(txt)
 
-    if S.k:
-        drift_chart(S, 340)
-
-    # Fixed slot below the chart: always present, so nothing shifts or pops up when a decision is needed.
-    if S.ready:
-        with st.spinner("Comparing models on the newest data..."):
-            S.ensure_decision()
-        decision_panel(S)
-    else:
-        with st.container(border=True):
-            if S.alert:
-                st.markdown("**Decision: not yet.** Possible drift since batch "
-                            f"{S.alert.start + 1}; collecting new labelled data.")
-                st.progress(min(S.new_rows / S.cfg.min_rows, 1.0),
-                            text=f"{S.new_rows:,} / {S.cfg.min_rows:,} new labelled rows")
-            elif S.done:
-                st.markdown("**Decision: none pending.** All batches have been processed.")
-            else:
-                st.markdown("**Decision: none needed.** Error is within the normal range. "
-                            "You will be asked here if drift is confirmed.")
+    left, right = st.columns([1.5, 1])             # both columns always exist: nothing moves or pops up
+    with left:
+        if S.k:
+            drift_chart(S)
+        else:
+            with st.container(border=True, height=SLOT_H):
+                st.caption("The error chart appears here. Press **Run** or **Next batch**.")
+    with right:
+        if S.ready:
+            with st.spinner("Comparing models on the newest data..."):
+                S.ensure_decision()
+            decision_panel(S)
+        else:
+            idle_panel(S)
     results_panel(S)
 
 
