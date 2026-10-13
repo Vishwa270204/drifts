@@ -8,7 +8,7 @@ import streamlit as st
 import drift_core as core
 from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 
-CSV_PATH = Path(__file__).resolve().parent / "synthetic_iot_sensor.csv"   # keep it next to app.py
+CSV_PATH = Path(__file__).resolve().parent / "synthetic_iot_sensor_data.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 CSS = """<style>
 .block-container{padding-top:1.6rem;padding-bottom:2rem;max-width:1100px}
