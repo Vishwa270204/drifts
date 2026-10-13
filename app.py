@@ -10,13 +10,15 @@ from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 
 CSV_PATH = Path(__file__).resolve().parent / "concept_drift_stream.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
-CHART_H = 420         # full-width chart height
+CHART_H = 290         # compact chart so the whole page fits one screen
 CSS = """<style>
-.block-container{padding-top:3rem;padding-bottom:1rem;max-width:1100px}
-[data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.3rem .8rem}
-[data-testid="stMetricValue"]{font-size:1.6rem}
-[data-testid="stVerticalBlock"]{gap:.6rem}
-h3{padding:0!important;margin:0!important}
+.block-container{padding-top:2.6rem;padding-bottom:.3rem;max-width:1200px}
+[data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.2rem .7rem}
+[data-testid="stMetricValue"]{font-size:1.35rem}
+[data-testid="stVerticalBlock"]{gap:.35rem}
+h3{padding:0!important;margin:0!important;font-size:1.25rem!important}
+[data-testid="stProgress"]{margin-bottom:-.3rem}
+[data-testid="stTabs"] [role="tablist"]{margin-bottom:-.4rem}
 </style>"""
 _NEW_API = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit()) >= (1, 50)
 
@@ -193,9 +195,9 @@ def drift_chart(S, height=CHART_H):
     if S.alert is not None and 1 <= S.alert.start + 1 <= n:
         fig.add_vrect(x0=S.alert.start + 1, x1=n, fillcolor="#c62828", opacity=0.07, line_width=0,
                       annotation_text="Drift", annotation_position="top left")
-    fig.update_layout(height=height, margin=dict(t=30, b=35, l=50, r=10), hovermode="x unified",
+    fig.update_layout(height=height, margin=dict(t=28, b=30, l=50, r=10), hovermode="x unified",
                       xaxis_title="Batch", yaxis_title="Error rate" if pct else "MAE",
-                      legend=dict(orientation="h", y=1.1, x=0))
+                      legend=dict(orientation="h", y=1.12, x=0))
     if pct:
         fig.update_yaxes(tickformat=".0%", rangemode="tozero")
     wide(st.plotly_chart, fig)
@@ -251,32 +253,31 @@ def decision_panel(S):
 def idle_panel(S):
     """Slim status strip shown below the chart while no decision is pending."""
     with st.container(border=True):
-        st.markdown("### Decision")
         if S.alert:
-            st.markdown(f"**Not yet.** Possible drift since batch {S.alert.start + 1}; collecting new labelled data.")
+            st.markdown(f"**Decision: not yet.** Possible drift since batch {S.alert.start + 1}; "
+                        "collecting new labelled data.")
             st.progress(min(S.new_rows / S.cfg.min_rows, 1.0),
                         text=f"{S.new_rows:,} / {S.cfg.min_rows:,} new labelled rows")
         elif S.done:
-            st.markdown("**None pending.** All batches have been processed.")
+            st.markdown("**Decision: none pending.** All batches have been processed.")
         else:
-            st.markdown("**None needed.** Error is within the normal range. You will be asked here if drift is "
-                        "confirmed.")
+            st.markdown("**Decision: none needed.** Error is within the normal range. You will be asked here "
+                        "if drift is confirmed.")
 
 
 def results_panel(S):
     if not (S.retrains or S.events):
         return
-    st.markdown("### History")
     tabs = st.tabs(["Updated models: before vs after", "Event log"] if S.retrains else ["Event log"])
     if S.retrains:
         with tabs[0]:
             t = S.retrain_summary()
             t[["Error before", "Error after"]] = t[["Error before", "Error after"]].round(4)
             t["Change (%)"] = t["Change (%)"].round(1)
-            wide(st.dataframe, t, hide_index=True, height=min(38 * (len(t) + 1), 200))
+            wide(st.dataframe, t, hide_index=True, height=min(35 * (len(t) + 1) + 3, 110))
             st.caption("Negative change = fewer errors after the update. Early numbers cover few batches.")
     with tabs[-1]:
-        wide(st.dataframe, pd.DataFrame(S.events), hide_index=True, height=200)
+        wide(st.dataframe, pd.DataFrame(S.events), hide_index=True, height=110)
 
 
 # ------------------------------------------------------------------ main
@@ -319,7 +320,6 @@ def main():
         lvl, txt = st.session_state.pop("flash")
         getattr(st, lvl)(txt)
 
-    st.markdown("#### Error over time")
     if S.k:
         drift_chart(S)
     else:
