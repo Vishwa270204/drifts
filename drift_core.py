@@ -1,26 +1,34 @@
 """Core logic for the Model Drift Dashboard (no Streamlit imports).
 
-A labelled dataset is streamed in batches through one deployed Hoeffding Adaptive Tree (river).
+A labelled dataset is streamed in batches through ONE Hoeffding Adaptive Tree (river) that learns continuously.
 
 Two separate ADWIN detectors exist and must not be confused:
-  * the tree's INTERNAL ADWIN (cfg.tree_adwin), inside every node; it only runs while the tree is learning and
-    swaps out branches that stopped working;
-  * the DASHBOARD ADWIN (cfg.adwin, `Session.det`), which watches the deployed model's prediction errors and raises
-    the drift alert. ADWIN has no numeric threshold: it cuts its window when two sub-windows differ significantly.
+  * the tree's INTERNAL ADWIN (cfg.tree_adwin), inside the tree's nodes; it only runs while the tree is learning and
+    lets the tree grow alternate subtrees and swap out branches that stopped working. It is configured in
+    make_tree() and is never touched by the dashboard;
+  * the DASHBOARD ADWIN (cfg.adwin, `Session.det`), which only WATCHES the model's prediction errors and raises an
+    informational alert. It never changes the model, and the model does not need it in order to learn. ADWIN has no
+    numeric error threshold: it cuts its window when two sub-windows differ significantly.
 
-On an alert the user compares "update" against "keep" on held-out recent rows and decides.
+Streaming workflow (per arriving batch k, with label delay d):
+  1. predict batch k with the current tree (no label of batch k is read);
+  2. the labels of batch j = k - d arrive: errors of the STORED predictions for batch j are computed, the dashboard
+     ADWIN is fed once, and then the tree learns batch j exactly once (so every record is predicted before it is
+     learned, and every error belongs to the tree state that made the prediction);
+  3. nothing waits for a user decision: an alert is only recorded and shown.
+After the last batch has arrived, the remaining delayed labels are released one batch per step.
+
     sess = Session.create(df, target, tcol, task, Config.simple(100, "Medium"))
-    sess.run(None); sess.ensure_decision(); sess.apply(sess.cand.rec)
+    sess.run(None)
 """
 from __future__ import annotations
 
-import copy
 import inspect
 import io
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -34,9 +42,7 @@ from sklearn.metrics import f1_score
 # evidence = fewer alerts, later). It is not an error threshold.
 SENS = {"Low (fewer alerts)": 0.0005, "Medium": 0.002, "High (more alerts)": 0.01}
 MIN_FIT = 30                    # minimum usable labelled rows to train a tree
-UPDATE, KEEP = "Update model", "Keep current model"
 METRICS = {"classification": ["Error rate", "1 - macro F1"], "regression": ["MAE"]}
-ROW_WISE = {"Error rate", "MAE"}   # metrics with a per-row loss (paired noise check possible)
 
 
 @dataclass
@@ -46,9 +52,7 @@ class Config:
     adwin: float = 0.002            # delta of the DASHBOARD drift detector (see SENS)
     adwin_input: str = "rows"       # "rows": feed each batch's row errors | "batch": one mean error per batch
     delay: int = 0                  # label delay (batches)
-    min_rows: int = 400             # new labelled rows needed before asking
-    snooze: int = 10                # batches without alerts after "keep"
-    hold_frac: float = 0.25         # share of new labelled rows held out for evaluation
+    alert_hold: int = 10            # batches a recent alert keeps the status line in "error increase detected"
     metric: Optional[str] = None    # None = chosen automatically
     seed: int = 42
     grace: int = 200                # Hoeffding Adaptive Tree internals (unchanged)
@@ -59,8 +63,8 @@ class Config:
 
     @classmethod
     def simple(cls, batch_size: int = 100, sensitivity: str = "Medium") -> "Config":
-        """The two user-facing choices; the rest scales from them."""
-        return cls(B=int(batch_size), adwin=SENS[sensitivity], min_rows=max(400, 4 * int(batch_size)))
+        """The two user-facing choices; the rest keeps its defaults."""
+        return cls(B=int(batch_size), adwin=SENS[sensitivity])
 
 
 # ======================================================================
@@ -125,7 +129,7 @@ class Bundle:
         return self
 
     def learn(self, X, y):
-        """Keep learning on the existing tree, one row at a time."""
+        """Keep learning on the existing tree, one row at a time (this is what lets HAT's own ADWIN operate)."""
         y = np.asarray(y)
         if len(y) == 0:
             raise ValueError("no labelled rows to learn from")
@@ -139,6 +143,17 @@ class Bundle:
             p = self.tree.predict_one(x)
             out.append((0.0 if p is None else float(p)) if reg else (self.major if p is None else str(p)))
         return np.asarray(out, float) if reg else np.asarray(out).astype(str)
+
+    def adaptation_counters(self) -> Optional[dict]:
+        """Cumulative counters kept by the tree itself, or None if this River version does not expose them.
+        Only these counters are treated as evidence that the tree changed its structure."""
+        names = {"pruned": "n_pruned_alternate_trees", "switched": "n_switch_alternate_trees"}
+        out = {}
+        for key, attr in names.items():
+            v = getattr(self.tree, attr, None)
+            if isinstance(v, (int, np.integer)) and not isinstance(v, bool):
+                out[key] = int(v)
+        return out or None
 
 # ======================================================================
 # metrics
@@ -167,7 +182,7 @@ def evaluate(task, y, p):
 
 
 def selection_score(metric, m):
-    """Lower is better for every metric."""
+    """Lower is better for every metric (used for the per-batch performance history)."""
     return {"Error rate": lambda: m["err"], "1 - macro F1": lambda: 1.0 - m["macro_f1"],
             "MAE": lambda: m["mae"]}[metric]()
 
@@ -181,6 +196,8 @@ def fmt_score(metric, v):
 # data
 # ======================================================================
 def read_csv_bytes(data: bytes) -> pd.DataFrame:
+    if not data or not data.strip():
+        raise ValueError("The file is empty.")
     for enc in ("utf-8-sig", "latin-1"):
         try:
             out = pd.read_csv(io.BytesIO(data), encoding=enc)
@@ -189,6 +206,8 @@ def read_csv_bytes(data: bytes) -> pd.DataFrame:
             return out
         except UnicodeDecodeError:
             continue
+        except (pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+            raise ValueError(f"Could not read the file as CSV: {exc}") from exc
     raise ValueError("Could not read the file as CSV.")
 
 
@@ -255,105 +274,9 @@ def pick_features(df, exclude):
             cat.append(c)
     return num, cat
 
-# ======================================================================
-# strategies
-# ======================================================================
-@dataclass
-class Plan:
-    kind: str                       # keep | continue
-    X: Optional[pd.DataFrame] = None
-    y: Optional[np.ndarray] = None
-
-
-@dataclass
-class Strategy:
-    name: str
-    plan: Callable
-
-
-def plan_update(sess, Xo, yo, Xn, yn):
-    return Plan("continue", Xn, yn)
-
-
-def plan_keep(sess, Xo, yo, Xn, yn):
-    return Plan("keep")
-
-
-STRATEGIES = [Strategy(UPDATE, plan_update), Strategy(KEEP, plan_keep)]
-REG = {s.name: s for s in STRATEGIES}
-
-
-def build(sess, name, data):
-    """Return a model for the strategy. Never mutates the deployed model (updates use a deep copy)."""
-    plan = REG[name].plan(sess, *data)
-    if plan.kind == "keep":
-        return sess.model
-    if plan.kind == "continue":
-        return copy.deepcopy(sess.model).learn(plan.X, plan.y)
-    raise ValueError(f"unknown plan kind {plan.kind}")
 
 # ======================================================================
-# decision
-# ======================================================================
-@dataclass
-class Decision:
-    error: Optional[str] = None
-    metric: str = ""
-    rec: str = KEEP
-    scores: dict = field(default_factory=dict)      # strategy -> held-out score (lower is better)
-    errs: dict = field(default_factory=dict)        # strategy -> per-row held-out error
-    hold: int = 0                                   # held-out rows
-    n_new: int = 0                                  # labelled rows since drift began
-    notes: list = field(default_factory=list)       # short reliability caveats
-
-    def change_pct(self, name: str) -> float:
-        """Relative change of a strategy's score vs keeping the current model (negative = better)."""
-        k, s = self.scores.get(KEEP, np.nan), self.scores.get(name, np.nan)
-        return (s - k) / k * 100 if np.isfinite(k) and np.isfinite(s) and k > 1e-12 else np.nan
-
-
-def compute_decision(sess) -> Decision:
-    Xo, yo, Xn, yn = sess.get_data()
-    n = len(yn)
-    if n < 2 * MIN_FIT:
-        return Decision(error=f"Only {n} new labelled rows, not enough to compare models (need {2 * MIN_FIT}).")
-    hold = int(np.clip(round(n * sess.cfg.hold_frac), MIN_FIT, n - MIN_FIT))
-    Xh, yh, Xt, yt = Xn.iloc[-hold:], yn[-hold:], Xn.iloc[:-hold], yn[:-hold]
-    task, metric = sess.task, sess.metric
-    scores, errs = {}, {}
-    for sp in STRATEGIES:
-        try:
-            p = build(sess, sp.name, (Xo, yo, Xt, yt)).predict(Xh)
-            if task == "regression" and not np.all(np.isfinite(np.asarray(p, float))):
-                raise ValueError("non-finite predictions")
-            scores[sp.name] = selection_score(metric, evaluate(task, yh, p))
-            errs[sp.name] = row_err(task, yh, p)
-        except Exception:
-            continue                                 # a failed candidate is simply not offered
-    if KEEP not in scores:
-        return Decision(error="The current model could not be evaluated on the recent data.")
-
-    order = {sp.name: i for i, sp in enumerate(STRATEGIES)}
-    valid = {k: v for k, v in scores.items() if np.isfinite(v)}
-    rec = min(valid, key=lambda k: (round(valid[k], 12), k != KEEP, order[k])) if valid else KEEP   # ties -> keep
-
-    notes = []
-    if task == "classification":
-        share = max(np.mean(yh == v) for v in np.unique(yh))
-        if share > 0.95:
-            notes.append(f"test rows are {share:.0%} one class")
-    if rec != KEEP and metric in ROW_WISE:
-        d = errs[KEEP] - errs[rec]
-        se = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else 0.0
-        if d.mean() <= se:
-            notes.append("the gain is within noise")
-    if hold < 100:
-        notes.append(f"small test sample ({hold} rows)")
-    return Decision(metric=metric, rec=rec, scores=scores, errs=errs, hold=hold, n_new=n, notes=notes)
-
-
-# ======================================================================
-# dashboard drift detector (ADWIN on the deployed model's errors)
+# dashboard drift detector (ADWIN on the model's prediction errors)
 # ======================================================================
 class DetectorError(RuntimeError):
     """The dashboard's ADWIN drift detector could not be created or updated."""
@@ -400,51 +323,51 @@ def adwin_update(det, x: float) -> bool:
 # ======================================================================
 # session
 # ======================================================================
-SCHEMA = 3   # bump when Session's fields change; the UI discards sessions created by older code
+SCHEMA = 4   # bump when Session's fields change; the UI discards sessions created by older code
 
 
 @dataclass
 class Alert:
+    """One informational error-increase detection of the dashboard ADWIN. Never requires an action."""
+    id: int                         # 1, 2, 3 ... in detection order (lets the UI show each alert once)
+    batch: int                      # 0-based batch whose labels made ADWIN signal
     start: int                      # estimated first batch of the change (from ADWIN's window cut)
-    detected: int                   # batch where ADWIN signalled
-    status: str = "waiting"         # waiting | ready
-
-
-@dataclass
-class Retrain:
-    version: int
-    strategy: str
-    applied: int                    # batch index when applied
-    start: int                      # batch index where drift began
+    rows_seen: int                  # stream rows that had arrived when the labels of that batch were released
+    reference: float                # error level ADWIN treated as normal just before the signal
+    recent: float                   # mean error of the signalling batch
+    n_signals: int = 1              # upward ADWIN signals inside that batch
 
 
 @dataclass
 class Session:
     X: pd.DataFrame
-    y: np.ndarray
+    y: np.ndarray                   # simulated history; labels of batch j are only read when they are released
     task: str
     cfg: Config
     n_tr: int
     N: int                          # rows in the streaming part
     nb: int                         # number of batches
     metric: str
-    model: Bundle
-    det: Any                        # dashboard ADWIN; reset on every model change or "keep"
+    model: Bundle                   # the one HAT; it learns continuously and is never replaced
+    det: Any                         # dashboard ADWIN; never reset by an alert
     err_scale: float                # errors are divided by this and clipped to [0, 1] before ADWIN (1.0 = 0/1 errors)
-    version: int = 0
-    version_start: int = 0          # first batch scored by the deployed model version
-    k: int = 0                      # batches received so far
-    errs: list = field(default_factory=list)        # mean error per batch (for the chart)
-    ver: list = field(default_factory=list)         # model version that scored each batch
-    batch_e: list = field(default_factory=list)     # per-row errors of each batch (kept until labels arrive)
-    last_fed: int = -1              # last batch given to ADWIN; guarantees no batch is fed twice
+    k: int = 0                      # batches that have arrived (and been predicted)
+    rel: int = 0                    # batches whose labels have been released (scored, monitored, learned)
+    learned: int = 0                # streamed rows the tree has learned from (excludes the initial training)
+    preds: list = field(default_factory=list)       # predictions of each arrived batch, stored until labels arrive
+    seen: list = field(default_factory=list)        # rows learned by the tree at the moment it predicted each batch
+    errs: list = field(default_factory=list)        # mean error per scored batch (index = batch)
+    scores: list = field(default_factory=list)      # selected metric per scored batch (lower is better)
+    batch_e: list = field(default_factory=list)     # per-row errors of each scored batch
+    last_fed: int = -1              # last batch given to the dashboard ADWIN; guarantees no batch is fed twice
+    last_learned: int = -1          # last batch given to the tree; guarantees no batch is learned twice
+    learn_failed: int = 0           # batches the tree could not learn from (see events)
     signals: list = field(default_factory=list)     # ADWIN detections: {"batch", "dir": "up" | "down"}
     levels: dict = field(default_factory=dict)      # batch -> ADWIN window mean (error units) after that batch
-    alert: Optional[Alert] = None
-    snooze_until: int = 0
-    cand: Optional[Decision] = None
+    alerts: list = field(default_factory=list)      # Alert records, in detection order
+    adaptations: list = field(default_factory=list)  # {"batch", "switched", "pruned"}: only if the tree's own counters rose
     events: list = field(default_factory=list)
-    retrains: list = field(default_factory=list)
+    adapt_prev: Optional[dict] = None               # tree counters seen after the previous batch
 
     # ---- construction
     @classmethod
@@ -452,6 +375,17 @@ class Session:
         """Raises ValueError with a readable message on bad input."""
         if not RIVER_OK:
             raise ValueError("The `river` package is not installed (pip install river).")
+        if df is None or len(df) == 0:
+            raise ValueError("The file has no rows.")
+        if target not in df.columns:
+            raise ValueError(f"Target column {target!r} is not in the file.")
+        if tcol not in (None, "(row order)") and tcol not in df.columns:
+            raise ValueError(f"Time column {tcol!r} is not in the file.")
+        if tcol == target:
+            raise ValueError("The time column and the target column must be different.")
+        if int(df[target].notna().sum()) == 0:
+            raise ValueError("The target column contains no labels. Supervised error monitoring and supervised "
+                             "incremental learning need the true outcomes, so they cannot run until labels exist.")
         d = df.copy()
         if tcol not in (None, "(row order)"):
             tv = pd.to_numeric(d[tcol], errors="coerce") if pd.api.types.is_numeric_dtype(d[tcol]) \
@@ -461,6 +395,8 @@ class Session:
         if task == "regression":
             yv = pd.to_numeric(d[target], errors="coerce")
             ok = np.isfinite(yv)
+            if not ok.any():
+                raise ValueError("The target column has no numeric values, so it cannot be used for regression.")
             d, y = d.loc[ok].reset_index(drop=True), yv[ok].to_numpy(float)
         else:
             d = d.reset_index(drop=True)
@@ -469,13 +405,13 @@ class Session:
         n_tr = int(len(d) * cfg.train_pct / 100)
         n_fit = int(n_tr * 0.8)
         if len(d) < 400:
-            raise ValueError("Need at least 400 labelled rows.")
+            raise ValueError(f"Need at least 400 labelled rows (found {len(d)}).")
         if n_fit < 50 or len(d) - n_tr < 2 * B:
             raise ValueError("Batch size is too large for this file. Lower it so the stream has at least 2 batches.")
         num, cat = pick_features(d.iloc[:n_tr], {target, tcol})   # chosen from the initial training rows only
         if not (num or cat):
             raise ValueError("No usable feature columns were found.")
-        X = build_frame(d, num, cat)
+        X = build_frame(d, num, cat)                              # the target is never part of X
         metric = cfg.metric if cfg.metric in METRICS[task] else auto_metric(task, y[:n_tr])
         try:
             model = Bundle(task, num, cat, cfg).fit(X.iloc[:n_fit], y[:n_fit])
@@ -490,94 +426,132 @@ class Session:
         except DetectorError as exc:
             raise ValueError(str(exc))
         N = len(y) - n_tr
-        return cls(X=X, y=y, task=task, cfg=cfg, n_tr=n_tr, N=N, nb=int(np.ceil(N / B)), metric=metric,
+        sess = cls(X=X, y=y, task=task, cfg=cfg, n_tr=n_tr, N=N, nb=int(np.ceil(N / B)), metric=metric,
                    model=model, det=det, err_scale=scale)
+        sess.adapt_prev = model.adaptation_counters()
+        return sess
 
     # ---- state queries
     @property
-    def ready(self) -> bool:
-        return self.alert is not None and self.alert.status == "ready"
-
-    @property
     def done(self) -> bool:
-        return self.k >= self.nb
+        """All batches have arrived and all their labels have been released and learned."""
+        return self.k >= self.nb and self.rel >= self.nb
 
     @property
     def can_advance(self) -> bool:
-        return not (self.ready or self.done)
+        return not self.done
+
+    @property
+    def labels_pending(self) -> int:
+        """Arrived batches whose labels are still delayed."""
+        return self.k - self.rel
+
+    @property
+    def rows_seen(self) -> int:
+        return min(self.k * self.cfg.B, self.N)
 
     @property
     def status(self) -> str:
-        if self.ready:
-            return "Decision needed"
         if self.done:
             return "Finished"
-        return "Collecting data" if self.alert else "Monitoring"
-
-    @property
-    def new_rows(self) -> int:
-        """Labelled rows available since the estimated change (respects label delay)."""
-        al = self.alert
-        if al is None:
-            return 0
-        known = self.k - self.cfg.delay
-        return max(0, min(known * self.cfg.B, self.N) - al.start * self.cfg.B)
+        last = self.alerts[-1] if self.alerts else None
+        if last is not None and (self.rel - 1) - last.batch < self.cfg.alert_hold:
+            return "Error increase detected — automatic learning continues"
+        return "Monitoring — automatic learning on"
 
     @property
     def unit(self) -> str:
         return "MAE" if self.task == "regression" else "error rate"
 
+    def new_alerts(self, shown: int) -> list:
+        """Alerts the UI has not displayed yet (`shown` = how many it already displayed)."""
+        return self.alerts[shown:]
+
     # ---- streaming engine
-    def _log(self, event, detail):
-        self.events.append({"Batch": self.k, "Event": event, "Detail": detail})
+    def _log(self, event, detail, batch: Optional[int] = None):
+        self.events.append({"Batch": self.k if batch is None else batch, "Event": event, "Detail": detail})
 
-    def _clear_alert(self):
-        self.alert, self.cand = None, None
-
-    def _reset_detector(self):
-        """Start a new monitoring period: a fresh ADWIN, so no state from an old model or old alert leaks in."""
-        self.det = make_monitor(self.cfg)
+    def _fmt(self, v: float) -> str:
+        return f"{v:.1%}" if self.task == "classification" else f"{v:.3g}"
 
     def step(self):
-        """Receive one batch: predict with the deployed model. Then, for the batch whose labels arrive now
-        (j = k - delay) and only if the deployed model scored it, update the drift detector once."""
-        cfg, k = self.cfg, self.k
-        a = self.n_tr + k * cfg.B
-        b = min(a + cfg.B, len(self.y))
-        if b <= a:
-            self.k = self.nb
+        """Advance the simulation by one step: receive the next batch (predict it with the current tree), then
+        release the labels that are due (batch j = k - delay), score the stored predictions, update the dashboard
+        ADWIN once, and let the tree learn that batch once. Once all batches have arrived, a step only releases
+        the next delayed labels."""
+        if self.done:
             return
-        e = row_err(self.task, self.y[a:b], self.model.predict(self.X.iloc[a:b]))
+        cfg = self.cfg
+        arrived = False
+        if self.k < self.nb:
+            a = self.n_tr + self.k * cfg.B
+            b = min(a + cfg.B, len(self.y))
+            self.preds.append(self.model.predict(self.X.iloc[a:b]))   # before any label of this batch is used
+            self.seen.append(self.learned)                           # which tree state made these predictions
+            self.k += 1
+            arrived = True
+        j = self.rel
+        if j < self.k and (not arrived or self.k - 1 - j >= cfg.delay):
+            self._release(j)
+
+    def _release(self, j: int):
+        """Labels of batch j arrive: score the predictions made earlier, monitor them, then learn the batch."""
+        cfg = self.cfg
+        a = self.n_tr + j * cfg.B
+        b = min(a + cfg.B, len(self.y))
+        yj, p = self.y[a:b], self.preds[j]
+        e = row_err(self.task, yj, p)                      # errors of the predictions that were actually made
         self.batch_e.append(e)
         self.errs.append(float(e.mean()))
-        self.ver.append(self.version)
-        self.k = k + 1
-        j = k - cfg.delay
-        if j >= 0 and j > self.last_fed and self.ver[j] == self.version:
-            self._monitor(j)
-        if self.alert and self.alert.status == "waiting" and self.new_rows >= cfg.min_rows:
-            self.alert.status = "ready"
+        self.scores.append(float(selection_score(self.metric, evaluate(self.task, yj, p))))
+        self._monitor(j)
+        if j > self.last_learned:                          # exactly once, and only after the batch was scored
+            try:
+                self.model.learn(self.X.iloc[a:b], yj)
+                self.learned += len(yj)
+                self._check_adaptation(j)
+            except Exception as exc:
+                self.learn_failed += 1
+                self._log("Learning skipped", f"batch {j + 1} could not be learned: {exc}", j + 1)
+            self.last_learned = j
+        self.rel = j + 1
+
+    def _check_adaptation(self, j: int):
+        """Report a structural change only when the tree's own counters say it happened."""
+        now = self.model.adaptation_counters()
+        prev = self.adapt_prev
+        self.adapt_prev = now
+        if not now or not prev:
+            return
+        sw, pr = now.get("switched", 0) - prev.get("switched", 0), now.get("pruned", 0) - prev.get("pruned", 0)
+        if sw > 0 or pr > 0:
+            self.adaptations.append({"batch": j, "switched": max(sw, 0), "pruned": max(pr, 0)})
+            self._log("Tree adapted", f"HAT's own counters report {max(sw, 0)} alternate-subtree switch(es) and "
+                                      f"{max(pr, 0)} pruned alternate subtree(s) while learning batch {j + 1}", j + 1)
 
     def _monitor(self, j: int):
-        """Feed batch j's errors to ADWIN exactly once and act on its signals.
+        """Feed batch j's errors to the dashboard ADWIN exactly once and record its signals.
 
         "rows" mode feeds the batch's row errors in order; "batch" mode feeds one mean error per batch. ADWIN is
         direction-blind (it also fires when error FALLS), so each signal is classed up/down by comparing the window
-        mean before and after the update. Only "up" raises an alert; "down" clears a waiting alert.
+        mean before and after the update. Only "up" creates an alert. The detector and the model are left alone.
         """
         cfg = self.cfg
+        if j <= self.last_fed:
+            return
         e = self.batch_e[j]
         raw = np.asarray(e if cfg.adwin_input == "rows" else [np.mean(e)], float)
         fin = np.isfinite(raw)
         if not fin.all():
             self._log("Skipped values", f"{int((~fin).sum())} non-finite error value(s) in batch {j + 1} "
-                                        "were not given to ADWIN")
+                                        "were not given to ADWIN", j + 1)
         ups, downs = [], []
         try:
             for i in np.flatnonzero(fin):
                 before = float(self.det.estimation)
                 if adwin_update(self.det, float(np.clip(raw[i] / self.err_scale, 0.0, 1.0))):
-                    (ups if float(self.det.estimation) > before else downs).append((int(i), int(self.det.width)))
+                    after = float(self.det.estimation)
+                    (ups if after > before else downs).append((int(i), int(self.det.width), before * self.err_scale))
         except DetectorError:
             raise
         except Exception as exc:
@@ -589,28 +563,29 @@ class Session:
             self.signals.append({"batch": j, "dir": "up"})
         if downs:
             self.signals.append({"batch": j, "dir": "down"})
-
-        if self.alert is None:
-            if ups and self.k > self.snooze_until:
-                start = self._change_point(j, *ups[0])
-                self.alert, self.cand = Alert(start=start, detected=j), None
-                self._log("Drift alert", f"ADWIN flagged a rise in error at batch {j + 1}; "
-                                         f"change estimated from batch {start + 1}")
-        elif self.alert.status == "waiting" and downs and not ups:
-            self._clear_alert()
-            self._log("Alert cleared", "ADWIN saw the error fall back before retraining was needed")
+        if ups:
+            i, width, ref = ups[0]
+            start = self._change_point(j, i, width)
+            al = Alert(id=len(self.alerts) + 1, batch=j, start=start,
+                       rows_seen=min((j + 1 + cfg.delay) * cfg.B, self.N), reference=ref,
+                       recent=self.errs[j], n_signals=len(ups))
+            self.alerts.append(al)
+            self._log("Error increase", f"ADWIN detected a statistically significant increase in the {self.unit} "
+                                        f"at batch {j + 1} ({self._fmt(ref)} before, {self._fmt(al.recent)} in this "
+                                        f"batch); estimated start: batch {start + 1}. This may or may not be concept "
+                                        "drift. The tree keeps learning on its own.", j + 1)
 
     def _change_point(self, j: int, i: int, width: int) -> int:
         """Batch where the change began. ADWIN's window cut is coarse (it keeps a few extra older values), so its
         estimate is a lower bound: the change is somewhere between it and the signal batch j. Within that range,
         pick the first batch whose error is above the midpoint between the error level just before the range and
-        the error at the signal. Never earlier than the batch where the deployed model began scoring."""
+        the error at the signal."""
         if self.cfg.adwin_input == "rows":
             est = (i - width + 1 + j * self.cfg.B) // self.cfg.B
         else:
             est = j - width + 1
-        est = int(max(self.version_start, min(est, j)))
-        before = self.errs[max(self.version_start, est - 5):est]
+        est = int(max(0, min(est, j)))
+        before = self.errs[max(0, est - 5):est]
         if before:
             mid = (float(np.mean(before)) + self.errs[j]) / 2
             for b in range(est, j + 1):
@@ -619,78 +594,11 @@ class Session:
         return est
 
     def run(self, n: Optional[int] = None):
-        """Advance up to n batches (None = until a decision is needed or the data ends)."""
+        """Advance up to n steps (None = until the stream is finished). Alerts never stop it."""
         i = 0
         while self.can_advance and (n is None or i < n):
             self.step()
             i += 1
-
-    # ---- data access
-    def get_data(self):
-        """(old X, old y, new X, new y): old = labelled rows before the change, new = since."""
-        B = self.cfg.B
-        s0 = self.n_tr + self.alert.start * B
-        s1 = max(s0, self.n_tr + min((self.k - self.cfg.delay) * B, self.N))
-        return self.X.iloc[:s0], self.y[:s0], self.X.iloc[s0:s1], self.y[s0:s1]
-
-    # ---- decisions
-    def ensure_decision(self) -> Decision:
-        """Computed once per alert; failures are stored as Decision(error=...)."""
-        if self.cand is None:
-            try:
-                self.cand = compute_decision(self)
-            except Exception as exc:
-                self.cand = Decision(error=f"Could not compare models: {exc}")
-        return self.cand
-
-    def keep(self, detail: Optional[str] = None) -> str:
-        """Dismiss the alert without changing the model; suppress new alerts for `snooze` batches.
-        The detector restarts, so the current (elevated) error level becomes its new baseline."""
-        n = self.cfg.snooze
-        self.snooze_until = self.k + n
-        self._log("Kept current model", detail or f"no alerts for {n} batches")
-        self._clear_alert()
-        self._reset_detector()
-        return f"Kept the current model (v{self.version}). No new alerts for {n} batches."
-
-    def apply(self, name):
-        """Returns (ok, message). The deployed model, version and detector change only on success."""
-        if name == KEEP:
-            return True, self.keep()
-        c, al = self.cand, self.alert
-        try:
-            if not c or name not in c.errs:
-                raise ValueError("this option was not evaluated")
-            data = self.get_data()
-            model = build(self, name, data)                # final build on ALL new labelled rows
-            model.predict(data[2].iloc[:1])                # smoke test before accepting
-            det = make_monitor(self.cfg)                   # build the new detector before touching any state
-        except Exception as exc:
-            self._log("Update failed", f"{exc}. Deployed model unchanged.")
-            return False, f"Update failed: {exc}. The deployed model was not changed."
-        self.model, self.det = model, det
-        self.version += 1
-        self.version_start = self.k                        # batches before this were scored by the old model
-        self.retrains.append(Retrain(version=self.version, strategy=name, applied=self.k, start=al.start))
-        self._log("Model updated", f"v{self.version} trained on {c.n_new:,} new rows; drift detector reset")
-        self._clear_alert()
-        return True, f"Model updated to v{self.version}."
-
-    # ---- reporting
-    def retrain_summary(self) -> pd.DataFrame:
-        """Live before/after error for every applied update."""
-        ver, errs = np.asarray(self.ver), np.asarray(self.errs, float)
-        rows = []
-        for r in self.retrains:
-            idx = np.arange(r.start, min(r.applied, len(errs)))
-            before = errs[idx][ver[idx] == r.version - 1] if len(idx) else np.array([])
-            after = errs[ver == r.version]
-            b, a = (before.mean() if len(before) else np.nan), (after.mean() if len(after) else np.nan)
-            rows.append({"Model": f"v{r.version}", "Updated at batch": r.applied + 1,
-                         "Batches since": int(len(after)), "Error before": b, "Error after": a,
-                         "Change (%)": (a - b) / b * 100 if np.isfinite(b) and b > 1e-12 and np.isfinite(a)
-                         else np.nan})
-        return pd.DataFrame(rows)
 
 
 Session.SCHEMA = SCHEMA
