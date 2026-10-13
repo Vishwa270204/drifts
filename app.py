@@ -13,13 +13,13 @@ PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
 CHART_H = 270         # full-width error chart
 CSS = """<style>
 /* page frame: full width, small margins, clear of Streamlit's toolbar */
-.block-container{padding:4.5rem 1.5rem 2rem 1.5rem;max-width:100%}
+.block-container{padding:3.6rem 1.5rem 2rem 1.5rem;max-width:100%}
 footer,#MainMenu{visibility:hidden}
 [data-testid="stVerticalBlock"]{gap:.45rem}
 
 /* headings */
 h3{padding:0!important;margin:0!important;font-size:1.2rem!important;line-height:1.5!important}
-.app-title{font-size:2.6rem;font-weight:800;line-height:1.25;margin:0 0 .15rem 0;white-space:nowrap}
+.app-title{font-size:2.6rem!important;font-weight:800!important;line-height:1.2!important;margin:0!important;padding:0!important;white-space:nowrap}
 .app-sub{opacity:.7;font-size:1.05rem;margin:0}
 .sec{font-size:.78rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;opacity:.6;margin:.1rem 0 0 0}
 
@@ -33,6 +33,16 @@ h3{padding:0!important;margin:0!important;font-size:1.2rem!important;line-height
 [data-testid="stAlert"]{padding:.45rem .8rem}
 [data-testid="stProgress"]{margin-bottom:-.2rem}
 [data-testid="stTabs"] [role="tablist"]{margin-bottom:-.2rem}
+
+/* equal-height bottom panels */
+.st-key-decision_box,.st-key-history_box{min-height:410px}
+.st-key-decision_box [data-testid="stVerticalBlock"]{gap:.75rem}
+.st-key-decision_box h3,.st-key-history_box h3{margin-bottom:.3rem!important}
+
+/* blue for actions; red is kept for drift only */
+button[data-testid="stBaseButton-primary"]{background-color:#1f6fb2!important;border-color:#1f6fb2!important;color:#fff!important}
+button[data-testid="stBaseButton-primary"]:hover{background-color:#185a93!important;border-color:#185a93!important}
+button[data-testid="stBaseButton-primary"]:disabled{opacity:.45}
 </style>"""
 _NEW_API = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit()) >= (1, 50)
 
@@ -152,11 +162,13 @@ def kpi_strip(S):
     pct = S.task == "classification"
     latest = "–" if len(errs) == 0 else (f"{errs[-1]:.1%}" if pct else f"{errs[-1]:.3f}")
     alerts = sum(1 for g in S.signals if g["dir"] == "up")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2.2], vertical_alignment="center")
     c1.metric("Deployed model", f"v{S.version}")
     c2.metric("Latest error", latest)
     c3.metric("Drift alerts", alerts)
     c4.metric("Model updates", len(S.retrains))
+    with c5:
+        st.progress(S.k / S.nb if S.nb else 0.0, text=f"Batch {S.k} of {S.nb}   ·   {S.status}")
 
 
 # ------------------------------------------------------------------ chart
@@ -200,7 +212,7 @@ def drift_chart(S, height=CHART_H):
 # ------------------------------------------------------------------ bottom row: decision (left) + history (right)
 def decision_panel(S):
     d = S.cand
-    with st.container(border=True):
+    with st.container(border=True, key="decision_box"):
         st.markdown("### ⚠️ Drift detected: your decision")
         if d.error:
             st.error(d.error)
@@ -246,7 +258,7 @@ def decision_panel(S):
 
 def idle_panel(S):
     """Same slot and height as the decision panel, so the layout never jumps."""
-    with st.container(border=True):
+    with st.container(border=True, key="decision_box"):
         st.markdown("### Decision")
         if S.alert:
             st.markdown(f"**Not yet.** Possible drift since batch {S.alert.start + 1}; collecting new labelled data.")
@@ -261,7 +273,7 @@ def idle_panel(S):
 
 def results_panel(S):
     """Always rendered at the same height as the decision panel."""
-    with st.container(border=True):
+    with st.container(border=True, key="history_box"):
         st.markdown("### History")
         if not (S.retrains or S.events):
             st.caption("Nothing yet. Drift alerts and model updates will be listed here.")
@@ -300,8 +312,8 @@ def main():
         st.toast("The app was updated, so the previous session was reset. Please start monitoring again.")
 
     # ---- header
-    h, p_set = st.columns([6, 1.4])
-    h.markdown('<p class="app-title">📈 Model Drift Dashboard</p>'
+    h, p_set = st.columns([6, 1.4], vertical_alignment="center")
+    h.markdown('<h1 class="app-title">📈 Model Drift Dashboard</h1>'
                '<p class="app-sub">Watch a deployed model for drift and decide when to update it.</p>',
                unsafe_allow_html=True)
     if S is not None:
@@ -316,7 +328,6 @@ def main():
 
     # ---- run controls + progress
     controls(S)
-    status_line(S)
     if st.session_state.get("flash"):
         lvl, txt = st.session_state.pop("flash")
         getattr(st, lvl)(txt)
