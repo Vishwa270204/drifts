@@ -10,13 +10,14 @@ from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 
 CSV_PATH = Path(__file__).resolve().parent / "concept_drift_stream.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
-CHART_H = 290         # compact chart so the whole page fits one screen
+CHART_H = 250         # compact chart so the whole page fits one screen
 CSS = """<style>
-.block-container{padding-top:2.6rem;padding-bottom:.3rem;max-width:1200px}
-[data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.2rem .7rem}
-[data-testid="stMetricValue"]{font-size:1.35rem}
-[data-testid="stVerticalBlock"]{gap:.35rem}
-h3{padding:0!important;margin:0!important;font-size:1.25rem!important}
+.block-container{padding-top:3.4rem;padding-bottom:.3rem;padding-left:1.5rem;padding-right:1.5rem;max-width:100%}
+[data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.15rem .7rem}
+[data-testid="stMetricValue"]{font-size:1.25rem}
+[data-testid="stVerticalBlock"]{gap:.3rem}
+h3{padding:0!important;margin:0!important;font-size:1.25rem!important;line-height:1.5!important}
+[data-testid="stAlert"]{padding:.4rem .8rem}
 [data-testid="stProgress"]{margin-bottom:-.3rem}
 [data-testid="stTabs"] [role="tablist"]{margin-bottom:-.4rem}
 </style>"""
