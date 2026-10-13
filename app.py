@@ -10,12 +10,12 @@ from drift_core import KEEP, SENS, UPDATE, Config, Session, fmt_score
 
 CSV_PATH = Path(__file__).resolve().parent / "concept_drift_stream.csv"   # keep it next to app.py
 PALETTE = ["#1f6fb2", "#e08a00", "#7a4fb5", "#00897b", "#a0522d", "#c2185b"]
-SLOT_H = 410          # chart and decision box share this height, so the page never shifts
+CHART_H = 420         # full-width chart height
 CSS = """<style>
-.block-container{padding-top:3rem;padding-bottom:.5rem;max-width:1300px}
+.block-container{padding-top:3rem;padding-bottom:1rem;max-width:1100px}
 [data-testid="stMetric"]{background:rgba(128,128,128,.07);border-radius:10px;padding:.3rem .8rem}
 [data-testid="stMetricValue"]{font-size:1.6rem}
-[data-testid="stVerticalBlock"]{gap:.5rem}
+[data-testid="stVerticalBlock"]{gap:.6rem}
 h3{padding:0!important;margin:0!important}
 </style>"""
 _NEW_API = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit()) >= (1, 50)
@@ -164,7 +164,7 @@ If you update, the model learns from **all** new rows.
 
 
 # ------------------------------------------------------------------ chart
-def drift_chart(S, height=SLOT_H):
+def drift_chart(S, height=CHART_H):
     n = min(S.k, len(S.ver), len(S.errs))
     xs, ver, errs = np.arange(1, n + 1), np.asarray(S.ver)[:n], np.asarray(S.errs, float)[:n]
     pct = S.task == "classification"
@@ -204,7 +204,7 @@ def drift_chart(S, height=SLOT_H):
 # ------------------------------------------------------------------ decision
 def decision_panel(S):
     d = S.cand
-    with st.container(border=True, height=SLOT_H):
+    with st.container(border=True):
         st.markdown("### ⚠️ Drift detected")
         if d.error:
             st.error(d.error)
@@ -217,15 +217,17 @@ def decision_panel(S):
                  + ("." if al.start == al.detected else f", and the change began around **batch {al.start + 1}**."))
         can_update = UPDATE in d.scores and np.isfinite(d.scores[UPDATE])
         cur = fmt_score(d.metric, d.scores[KEEP])
-        a, b = st.columns(2)
-        a.metric("Current model", cur)
         new = fmt_score(d.metric, d.scores[UPDATE]) if can_update else "n/a"
+
+        m1, m2 = st.columns(2)                       # compact comparison row inside the decision section
+        m1.metric("Current model", cur)
         if can_update:
             ch = d.change_pct(UPDATE)
-            b.metric("Updated model", new, delta=None if np.isnan(ch) else f"{ch:+.1f}%", delta_color="inverse")
+            m2.metric("Updated model", new, delta=None if np.isnan(ch) else f"{ch:+.1f}%", delta_color="inverse")
         else:
-            b.metric("Updated model", new)
+            m2.metric("Updated model", new)
         st.caption(f"{d.metric}, measured on the {d.hold} newest labelled rows (lower is better).")
+
         rec_update = d.rec == UPDATE
         if rec_update:
             st.success(f"**Update the model.** It scores lower on recent data ({new} vs {cur}).")
@@ -233,6 +235,7 @@ def decision_panel(S):
             st.info("**Keep the current model.** The update is not better on recent data.")
         if d.notes:
             st.caption("⚠️ Take with care: " + "; ".join(d.notes) + ".")
+
         c1, c2 = st.columns(2)
         if c1.button("Update model", type="primary" if rec_update else "secondary", disabled=not can_update,
                      key=f"apply_{S.k}", width="stretch"):
@@ -245,25 +248,9 @@ def decision_panel(S):
             st.rerun()
 
 
-def results_panel(S):
-    if not (S.retrains or S.events):
-        return
-    tabs = st.tabs(["Updated models: before vs after", "Event log"] if S.retrains else ["Event log"])
-    if S.retrains:
-        with tabs[0]:
-            t = S.retrain_summary()
-            t[["Error before", "Error after"]] = t[["Error before", "Error after"]].round(4)
-            t["Change (%)"] = t["Change (%)"].round(1)
-            wide(st.dataframe, t, hide_index=True, height=min(38 * (len(t) + 1), 160))
-            st.caption("Negative change = fewer errors after the update. Early numbers cover few batches.")
-    with tabs[-1]:
-        wide(st.dataframe, pd.DataFrame(S.events), hide_index=True, height=150)
-
-
-# ------------------------------------------------------------------ main
 def idle_panel(S):
-    """Same slot as the decision box, so the layout is identical before and after a decision is needed."""
-    with st.container(border=True, height=SLOT_H):
+    """Slim status strip shown below the chart while no decision is pending."""
+    with st.container(border=True):
         st.markdown("### Decision")
         if S.alert:
             st.markdown(f"**Not yet.** Possible drift since batch {S.alert.start + 1}; collecting new labelled data.")
@@ -276,6 +263,23 @@ def idle_panel(S):
                         "confirmed.")
 
 
+def results_panel(S):
+    if not (S.retrains or S.events):
+        return
+    st.markdown("### History")
+    tabs = st.tabs(["Updated models: before vs after", "Event log"] if S.retrains else ["Event log"])
+    if S.retrains:
+        with tabs[0]:
+            t = S.retrain_summary()
+            t[["Error before", "Error after"]] = t[["Error before", "Error after"]].round(4)
+            t["Change (%)"] = t["Change (%)"].round(1)
+            wide(st.dataframe, t, hide_index=True, height=min(38 * (len(t) + 1), 200))
+            st.caption("Negative change = fewer errors after the update. Early numbers cover few batches.")
+    with tabs[-1]:
+        wide(st.dataframe, pd.DataFrame(S.events), hide_index=True, height=200)
+
+
+# ------------------------------------------------------------------ main
 def main():
     st.set_page_config(page_title="Model Drift Dashboard", page_icon="📈", layout="wide",
                        initial_sidebar_state="collapsed")
@@ -308,26 +312,27 @@ def main():
         st.info("Pick the target column above and click **Start monitoring**.")
         st.stop()
 
+    # ---- single-column, top-to-bottom layout ----
     controls(S)
     status_line(S)
     if st.session_state.get("flash"):
         lvl, txt = st.session_state.pop("flash")
         getattr(st, lvl)(txt)
 
-    left, right = st.columns([1.5, 1])             # both columns always exist: nothing moves or pops up
-    with left:
-        if S.k:
-            drift_chart(S)
-        else:
-            with st.container(border=True, height=SLOT_H):
-                st.caption("The error chart appears here. Press **Run** or **Next batch**.")
-    with right:
-        if S.ready:
-            with st.spinner("Comparing models on the newest data..."):
-                S.ensure_decision()
-            decision_panel(S)
-        else:
-            idle_panel(S)
+    st.markdown("#### Error over time")
+    if S.k:
+        drift_chart(S)
+    else:
+        with st.container(border=True, height=CHART_H):
+            st.caption("The error chart appears here. Press **Run** or **Next batch**.")
+
+    if S.ready:
+        with st.spinner("Comparing models on the newest data..."):
+            S.ensure_decision()
+        decision_panel(S)
+    else:
+        idle_panel(S)
+
     results_panel(S)
 
 
