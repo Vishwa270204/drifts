@@ -283,7 +283,17 @@ def main():
     if not core.RIVER_OK:
         st.error("This app needs the `river` package. Install it with `pip install river` and restart.")
         st.stop()
+    missing = [n for n in ("SCHEMA", "DetectorError") if not hasattr(core, n)]
+    if missing:
+        st.error("`drift_core.py` is out of date for this `app.py`. Upload the latest `drift_core.py` next to it "
+                 "and reboot the app.")
+        st.stop()
     S = st.session_state.get("S")
+    if S is not None and getattr(S, "SCHEMA", None) != core.SCHEMA:     # session made by an older version of the code
+        st.session_state.pop("S", None)
+        st.session_state.pop("flash", None)
+        S = None
+        st.toast("The app was updated, so the previous session was reset. Please start monitoring again.")
     h, p_set, p_help = st.columns([5, 1.3, 1.5])
     h.markdown("### 📈 Model Drift Dashboard")
     with p_help:
