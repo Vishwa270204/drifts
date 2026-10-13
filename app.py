@@ -314,8 +314,7 @@ def main():
 
     # ---- header
     h, p_set = st.columns([6, 1.4], vertical_alignment="center")
-    h.markdown('<h1 class="app-title">📈 Model Drift Dashboard</h1>', unsafe_allow_html=True),
-                unsafe_allow_html=True)
+    h.markdown('<h1 class="app-title">📈 Model Drift Dashboard</h1>', unsafe_allow_html=True),unsafe_allow_html=True)
     if S is not None:
         with p_set:
             settings_panel(S)                       # compact popover once monitoring has started
