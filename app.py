@@ -327,14 +327,16 @@ def main():
         with st.container(border=True, height=CHART_H):
             st.caption("The error chart appears here. Press **Run** or **Next batch**.")
 
-    if S.ready:
-        with st.spinner("Comparing models on the newest data..."):
-            S.ensure_decision()
-        decision_panel(S)
-    else:
-        idle_panel(S)
-
-    results_panel(S)
+    left, right = st.columns([1, 1])               # decision on the left, history / event log on the right
+    with left:
+        if S.ready:
+            with st.spinner("Comparing models on the newest data..."):
+                S.ensure_decision()
+            decision_panel(S)
+        else:
+            idle_panel(S)
+    with right:
+        results_panel(S)
 
 
 if __name__ == "__main__":
